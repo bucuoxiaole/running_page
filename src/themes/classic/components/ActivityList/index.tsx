@@ -24,6 +24,8 @@ import { DIST_UNIT, M_TO_DIST } from '../../utils/utils';
 import type { Activity } from '../../utils/utils';
 import useActivities from '../../hooks/useActivities';
 import { useLocale } from '@/hooks/useLocale';
+import { exportCard } from '@/utils/exportCard';
+import { SvgTitleTipHost } from './SvgTitleTipHost';
 // Layout constants (avoid magic numbers)
 const ITEM_WIDTH = 280;
 const ITEM_GAP = 20;
@@ -36,6 +38,10 @@ export interface ActivityListProps {
    * layout, styles, and chart behavior stay identical to upstream classic.
    */
   embedded?: boolean;
+  /** Optional starting interval (dashboard Life restore uses `life`). */
+  initialInterval?: 'year' | 'month' | 'week' | 'day' | 'life';
+  /** Hide year/month/week/day/Life chips when parent owns period pills. */
+  hideIntervalChips?: boolean;
 }
 
 const VIRTUAL_LIST_STYLES = {
@@ -211,6 +217,14 @@ const getSportTypeOptions = (activityData: Activity[]) => {
   return cache.sportTypeOptions;
 };
 
+const defaultSelectedYear = (years: string[]): string | null => {
+  if (!years.length) return null;
+  const calendarYear = String(new Date().getFullYear());
+  if (years.includes(calendarYear)) return calendarYear;
+  // availableYears is newest-first
+  return years[0] ?? null;
+};
+
 const getAvailableActivityYears = (activityData: Activity[]) => {
   const cache = getActivityListCache(activityData);
   if (cache.availableYears) return cache.availableYears;
@@ -367,8 +381,7 @@ const groupActivitiesByInterval = (
         (acc[key].dailyDistances[index] || 0) + distance;
       if (distance > acc[key].maxDistance) acc[key].maxDistance = distance;
       if (speed > acc[key].maxSpeed) acc[key].maxSpeed = speed;
-      if (intervalArg === 'day')
-        acc[key].location = activity.location_country || '';
+      // Day cards: never surface place names (privacy / product rule).
 
       return acc;
     }, {} as ActivityGroups);
@@ -455,14 +468,21 @@ function useActivityListMeasurements(
   const sampleResizeObserverRef = useRef<ResizeObserver | null>(null);
   const layoutFrameRef = useRef<number | null>(null);
 
-  const itemsPerRowStore = useMemo(() => createSnapshotStore(0), []);
+  const itemsPerRowStore = useMemo(
+    () => createSnapshotStore(embedded ? (interval === 'day' ? 2 : 1) : 0),
+    // once per mount — embed defaults avoid a 0-column / viewport-tall first paint
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
   const cardWidthStore = useMemo(
     () => createSnapshotStore(itemWidth),
     [itemWidth]
   );
   const rowHeightStore = useMemo(() => createSnapshotStore(360), []);
   const listHeightStore = useMemo(
-    () => createSnapshotStore(getInitialListHeight()),
+    () => createSnapshotStore(embedded ? 320 : getInitialListHeight()),
+    // once per mount — embed must not start at window.innerHeight-40
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     []
   );
 
@@ -492,19 +512,32 @@ function useActivityListMeasurements(
     if (!container) return;
     const containerWidth = container.clientWidth;
     if (embedded) {
-      // Year/month/week: one full-width card on mobile. Day stays two columns —
-      // those cards are lighter and look better side by side.
+      // Year/month/week: one full-width card on mobile.
+      // Day: fluid columns (2–3) so each card reads like a mini hero panel.
       const isMobile = containerWidth <= 640;
-      const count = isMobile
-        ? interval === 'day' && containerWidth >= 300
-          ? 2
-          : 1
-        : Math.max(1, Math.floor((containerWidth + gap) / (itemWidth + gap)));
+      let count: number;
+      if (isMobile) {
+        count = interval === 'day' && containerWidth >= 300 ? 2 : 1;
+      } else if (interval === 'day') {
+        // Narrower day cards (was 300/3-col) — less empty right pad on desktop.
+        const minDayWidth = 220;
+        count = Math.max(
+          2,
+          Math.min(4, Math.floor((containerWidth + gap) / (minDayWidth + gap)))
+        );
+      } else {
+        count = Math.max(
+          1,
+          Math.floor((containerWidth + gap) / (itemWidth + gap))
+        );
+      }
       const width = Math.floor(
         (containerWidth - gap * Math.max(0, count - 1)) / count
       );
       itemsPerRowStore.setSnapshot(count);
-      cardWidthStore.setSnapshot(isMobile ? width : itemWidth);
+      cardWidthStore.setSnapshot(
+        isMobile || interval === 'day' ? width : itemWidth
+      );
       return;
     }
     const count = Math.floor((containerWidth + gap) / (itemWidth + gap));
@@ -601,7 +634,9 @@ function useActivityListMeasurements(
       containerRef.current = node;
 
       if (!node) {
-        itemsPerRowStore.setSnapshot(0);
+        itemsPerRowStore.setSnapshot(
+          embedded ? (interval === 'day' ? 2 : 1) : 0
+        );
         return;
       }
 
@@ -610,7 +645,13 @@ function useActivityListMeasurements(
       containerResizeObserverRef.current = observer;
       scheduleMeasurementUpdate();
     },
-    [disconnectContainerObserver, itemsPerRowStore, scheduleMeasurementUpdate]
+    [
+      disconnectContainerObserver,
+      embedded,
+      interval,
+      itemsPerRowStore,
+      scheduleMeasurementUpdate,
+    ]
   );
 
   const setFilterContainerRef = useCallback(
@@ -753,25 +794,39 @@ const ActivityCardInner: React.FC<ActivityCardProps> = ({
     >
       <div className={`${cs.cardInner} ${isFlipped ? cs.flipped : ''}`}>
         <div className={cs.cardFront}>
-          <h2 className={cs.activityName}>{period}</h2>
+          <h2
+            className={`${cs.activityName}${
+              embedded && interval === 'day' ? ` ${cs.activityNameDay}` : ''
+            }`}
+          >
+            {period}
+          </h2>
           {embedded ? (
             <>
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'flex-start',
-                  justifyContent: 'space-between',
-                  gap: 12,
-                }}
-              >
-                <div style={{ minWidth: 0 }}>
-                  <p className={cs.statHero}>
+              <div className={cs.statHeroRow}>
+                <div
+                  className={`${cs.statHeroBlock}${
+                    interval === 'day' ? ` ${cs.statHeroBlockDay}` : ''
+                  }`}
+                >
+                  <p
+                    className={
+                      interval === 'day' ? cs.statHeroDay : cs.statHero
+                    }
+                  >
                     {summary.totalDistance.toFixed(2)}
                     <span className={cs.statHeroUnit}> {DIST_UNIT}</span>
                   </p>
                   <p className={cs.statMeta}>
                     {formatTime(summary.totalTime)}
-                    {interval !== 'day' && (
+                    {interval === 'day' ? (
+                      summary.count > 1 ? (
+                        <>
+                          <span className={cs.statMetaSep}>·</span>
+                          {summary.count} {t('times')}
+                        </>
+                      ) : null
+                    ) : (
                       <>
                         <span className={cs.statMetaSep}>·</span>
                         {summary.count} {t('times')}
@@ -779,15 +834,8 @@ const ActivityCardInner: React.FC<ActivityCardProps> = ({
                     )}
                   </p>
                 </div>
-                {showElevation && (
-                  <div
-                    className={cs.statCell}
-                    style={{
-                      flex: '0 0 auto',
-                      alignItems: 'flex-end',
-                      textAlign: 'right',
-                    }}
-                  >
+                {showElevation ? (
+                  <div className={cs.statElevCorner}>
                     <span className={cs.statLabel}>
                       <svg
                         width="14"
@@ -812,48 +860,73 @@ const ActivityCardInner: React.FC<ActivityCardProps> = ({
                       {elevationGain.toFixed(0)} m
                     </span>
                   </div>
-                )}
+                ) : null}
               </div>
-              <div className={cs.statGrid}>
-                <div className={cs.statCell}>
-                  <span className={cs.statLabel}>{t('avgPace')}</span>
-                  <span className={cs.statValue}>
-                    {formatPace(summary.averageSpeed)}
-                  </span>
-                </div>
-                <div className={cs.statCell}>
-                  <span className={cs.statLabel}>{t('avgDistance')}</span>
-                  <span className={cs.statValue}>
-                    {avgDistance.toFixed(2)} {DIST_UNIT}
-                  </span>
-                </div>
-                {interval !== 'day' && (
-                  <>
-                    <div className={cs.statCell}>
-                      <span className={cs.statLabel}>
-                        {t('longestActivity')}
-                      </span>
-                      <span className={cs.statValue}>
-                        {summary.maxDistance.toFixed(2)} {DIST_UNIT}
-                      </span>
-                    </div>
-                    <div className={cs.statCell}>
-                      <span className={cs.statLabel}>{t('fastestPace')}</span>
-                      <span className={cs.statValue}>
-                        {formatPace(summary.maxSpeed)}
-                      </span>
-                    </div>
-                  </>
-                )}
-                {summary.averageHeartRate !== undefined && (
-                  <div className={cs.statCell}>
-                    <span className={cs.statLabel}>{t('avgHeartRate')}</span>
-                    <span className={cs.statValue}>
-                      {summary.averageHeartRate.toFixed(0)} bpm
+              {interval === 'day' ? (
+                <div className={cs.statPillRow}>
+                  <div className={cs.statPill}>
+                    <span className={cs.statPillLabel}>{t('avgPace')}</span>
+                    <span className={cs.statPillValue}>
+                      {formatPace(summary.averageSpeed)}
                     </span>
                   </div>
-                )}
-              </div>
+                  {summary.averageHeartRate !== undefined ? (
+                    <div className={cs.statPill}>
+                      <span className={cs.statPillLabel}>
+                        {t('avgHeartRate')}
+                      </span>
+                      <span className={cs.statPillValue}>
+                        {summary.averageHeartRate.toFixed(0)} bpm
+                      </span>
+                    </div>
+                  ) : null}
+                  {summary.count > 1 ? (
+                    <div className={cs.statPill}>
+                      <span className={cs.statPillLabel}>
+                        {t('avgDistance')}
+                      </span>
+                      <span className={cs.statPillValue}>
+                        {avgDistance.toFixed(2)} {DIST_UNIT}
+                      </span>
+                    </div>
+                  ) : null}
+                </div>
+              ) : (
+                <div className={cs.statGrid}>
+                  <div className={cs.statCell}>
+                    <span className={cs.statLabel}>{t('avgPace')}</span>
+                    <span className={cs.statValue}>
+                      {formatPace(summary.averageSpeed)}
+                    </span>
+                  </div>
+                  <div className={cs.statCell}>
+                    <span className={cs.statLabel}>{t('avgDistance')}</span>
+                    <span className={cs.statValue}>
+                      {avgDistance.toFixed(2)} {DIST_UNIT}
+                    </span>
+                  </div>
+                  <div className={cs.statCell}>
+                    <span className={cs.statLabel}>{t('longestActivity')}</span>
+                    <span className={cs.statValue}>
+                      {summary.maxDistance.toFixed(2)} {DIST_UNIT}
+                    </span>
+                  </div>
+                  <div className={cs.statCell}>
+                    <span className={cs.statLabel}>{t('fastestPace')}</span>
+                    <span className={cs.statValue}>
+                      {formatPace(summary.maxSpeed)}
+                    </span>
+                  </div>
+                  {summary.averageHeartRate !== undefined && (
+                    <div className={cs.statCell}>
+                      <span className={cs.statLabel}>{t('avgHeartRate')}</span>
+                      <span className={cs.statValue}>
+                        {summary.averageHeartRate.toFixed(0)} bpm
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
             </>
           ) : (
             <div className={styles.activityDetails}>
@@ -984,18 +1057,113 @@ const ActivityCard = React.memo(ActivityCardInner, activityCardAreEqual);
 
 const ActivityListInner: React.FC<
   ActivityListProps & { navigate?: NavigateFunction }
-> = ({ onBack, embedded = false, navigate }) => {
+> = ({
+  onBack,
+  embedded = false,
+  navigate,
+  initialInterval = 'month',
+  hideIntervalChips = false,
+}) => {
   const { activities: activityData } = useActivities();
   const { t, locale } = useLocale();
   const cs = embedded ? embedStyles : styles;
-  const [interval, setInterval] = useState<IntervalType>('month');
+  const [intervalState, setInterval] = useState<IntervalType>(initialInterval);
+  // Embedded Pro Summary owns period pills via initialInterval. Keep interval
+  // controlled so day->Life never paints a stale Day card grid while the host
+  // drops `.summary-day-classic` (overflow/width thrash = visible shrink).
+  const interval: IntervalType = embedded ? initialInterval : intervalState;
   const [sportType, setSportType] = useState<string>('all');
-  const [selectedYear, setSelectedYear] = useState<string | null>(null);
+  // Day / Life keep independent year chips (Pro Summary switches interval in-place).
+  // Sync defaults on first mount (activities already resolved via Suspense) so the
+  // first paint never shows the unfiltered full Day list / full Life SVG.
+  const [daySelectedYear, setDaySelectedYear] = useState<string | null>(() =>
+    defaultSelectedYear(getAvailableActivityYears(activityData))
+  );
+  const [lifeSelectedYear, setLifeSelectedYear] = useState<string | null>(() =>
+    defaultSelectedYear(getAvailableActivityYears(activityData))
+  );
+  const [otherSelectedYear, setOtherSelectedYear] = useState<string | null>(
+    null
+  );
+  const dayYearSeededRef = useRef(
+    defaultSelectedYear(getAvailableActivityYears(activityData)) != null
+  );
+  const lifeYearSeededRef = useRef(
+    defaultSelectedYear(getAvailableActivityYears(activityData)) != null
+  );
+  const lifeCaptureRef = useRef<HTMLDivElement>(null);
+  const [lifeExporting, setLifeExporting] = useState(false);
+  const lifeExportingRef = useRef(false);
+  const [lifeExportMessage, setLifeExportMessage] = useState('');
+
+  // Success hint is transient; errors stay until the next export attempt.
+  useEffect(() => {
+    if (!lifeExportMessage) return;
+    const isSuccess =
+      lifeExportMessage === '图片已下载' ||
+      lifeExportMessage === 'Image downloaded';
+    if (!isSuccess) return;
+    const timer = window.setTimeout(() => setLifeExportMessage(''), 2500);
+    return () => window.clearTimeout(timer);
+  }, [lifeExportMessage]);
 
   const availableYears = useMemo(
     () => getAvailableActivityYears(activityData),
     [activityData]
   );
+
+  // Seed defaults once per mode: calendar year if present, else newest with data.
+  // Prevents first Day/Life visit from rendering the unfiltered full set / full Life SVG.
+  useEffect(() => {
+    if (!availableYears.length) return;
+    const def = defaultSelectedYear(availableYears);
+    if (!def) return;
+    if (!dayYearSeededRef.current) {
+      dayYearSeededRef.current = true;
+      setDaySelectedYear(def);
+    }
+    if (!lifeYearSeededRef.current) {
+      lifeYearSeededRef.current = true;
+      setLifeSelectedYear(def);
+    }
+  }, [availableYears]);
+
+  const selectedYear =
+    interval === 'life'
+      ? lifeSelectedYear
+      : interval === 'day'
+        ? daySelectedYear
+        : otherSelectedYear;
+
+  const setSelectedYear = useCallback(
+    (year: string | null) => {
+      if (interval === 'life') setLifeSelectedYear(year);
+      else if (interval === 'day') setDaySelectedYear(year);
+      else setOtherSelectedYear(year);
+    },
+    [interval]
+  );
+
+  const handleLifeExport = useCallback(async () => {
+    if (!lifeCaptureRef.current || lifeExportingRef.current) return;
+    lifeExportingRef.current = true;
+    setLifeExporting(true);
+    setLifeExportMessage('');
+    const label = selectedYear ?? 'life';
+    try {
+      await exportCard(lifeCaptureRef.current, `life-${label}.png`);
+      setLifeExportMessage(locale === 'zh' ? '图片已下载' : 'Image downloaded');
+    } catch (err) {
+      console.error('Life export failed:', err);
+      setLifeExportMessage(
+        locale === 'zh' ? '导出失败，请重试' : 'Export failed. Please retry.'
+      );
+    } finally {
+      lifeExportingRef.current = false;
+      setLifeExporting(false);
+    }
+  }, [locale, selectedYear]);
+
   const sportTypeOptions = useMemo(
     () => getSportTypeOptions(activityData),
     [activityData]
@@ -1072,8 +1240,11 @@ const ActivityListInner: React.FC<
   }
 
   const dataList = useMemo(() => {
+    // Life never renders the period card list - skip grouping so day->Life
+    // does not burn a frame aggregating hundreds of day rows first.
+    if (interval === 'life') return [];
     const summaries = getPeriodSummaries(activityData, interval, sportType);
-    if (!embedded || !selectedYear || interval === 'life') return summaries;
+    if (!embedded || !selectedYear) return summaries;
     return summaries.filter(({ period }) =>
       periodMatchesYear(period, selectedYear, interval)
     );
@@ -1136,7 +1307,9 @@ const ActivityListInner: React.FC<
       ? '100%'
       : `${itemsPerRow * (embedded ? cardWidth : ITEM_WIDTH) + Math.max(0, itemsPerRow - 1) * ITEM_GAP}px`;
 
-  const loading = itemsPerRow < 1 || !rowHeight;
+  // Classic full-page Summary still waits for measure; Pro embed must not —
+  // a viewport-tall LOADING_TEXT was covering the Summary period tabs visually.
+  const loading = embedded ? false : itemsPerRow < 1 || !rowHeight;
   const SelectedYearSvg = selectedYear
     ? yearSummarySvgs[`./year_summary_${selectedYear}.svg`]
     : null;
@@ -1196,14 +1369,15 @@ const ActivityListInner: React.FC<
         </div>
       )}
       <div className={cs.filterContainer} ref={setFilterContainerRef}>
-        {!onBack && (
+        {!onBack && !embedded && (
           <button className={styles.smallHomeButton} onClick={handleHomeClick}>
             {HOME_PAGE_TITLE}
           </button>
         )}
         {embedded ? (
           <>
-            {showSportTypeFilter ? (
+            {/* Life only allows "all" — hide sport row so year chips align with 年/月/周. */}
+            {showSportTypeFilter && interval !== 'life' ? (
               <div className={cs.chipRow}>
                 {sportTypeOptions.map((type) => {
                   const disabled = interval === 'life' && type !== 'all';
@@ -1222,37 +1396,117 @@ const ActivityListInner: React.FC<
                 })}
               </div>
             ) : null}
-            <div className={cs.chipRow}>
-              {intervalOptions.map(({ value, label }) => (
-                <button
-                  key={value}
-                  type="button"
-                  className={`${cs.filterChip} ${interval === value ? cs.filterChipActive : ''}`}
-                  onClick={() => toggleInterval(value)}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-            {availableYears.length > 0 ? (
-              <div
-                className={cs.chipRow}
-                role="group"
-                aria-label={locale === 'zh' ? '年份' : 'Year'}
-              >
-                {availableYears.map((year) => (
+            {!hideIntervalChips ? (
+              <div className={cs.chipRow}>
+                {intervalOptions.map(({ value, label }) => (
                   <button
-                    key={year}
+                    key={value}
                     type="button"
-                    className={`${cs.filterChip} ${selectedYear === year ? cs.filterChipActive : ''}`}
-                    onClick={() =>
-                      setSelectedYear(selectedYear === year ? null : year)
-                    }
+                    className={`${cs.filterChip} ${interval === value ? cs.filterChipActive : ''}`}
+                    onClick={() => toggleInterval(value)}
                   >
-                    {year}
+                    {label}
                   </button>
                 ))}
               </div>
+            ) : null}
+            {availableYears.length > 0 || interval === 'life' ? (
+              interval === 'life' ? (
+                <div
+                  className={cs.chipRowWithExport}
+                  role="group"
+                  aria-label={locale === 'zh' ? '年份' : 'Year'}
+                >
+                  <div className={cs.chipRowYears}>
+                    {availableYears.map((year) => (
+                      <button
+                        key={year}
+                        type="button"
+                        className={`${cs.filterChip} ${selectedYear === year ? cs.filterChipActive : ''}`}
+                        onClick={() =>
+                          setSelectedYear(selectedYear === year ? null : year)
+                        }
+                      >
+                        {year}
+                      </button>
+                    ))}
+                  </div>
+                  <div className={cs.lifeExportTrailing}>
+                    <button
+                      type="button"
+                      className={cs.lifeExportIconBtn}
+                      onClick={handleLifeExport}
+                      disabled={lifeExporting}
+                      data-export-hidden
+                      title={
+                        locale === 'zh'
+                          ? '下载 Life 图片'
+                          : 'Download Life image'
+                      }
+                      aria-label={
+                        locale === 'zh'
+                          ? '下载 Life 图片'
+                          : 'Download Life image'
+                      }
+                    >
+                      {lifeExporting ? (
+                        <svg
+                          className={cs.lifeExportIconSpin}
+                          fill="none"
+                          viewBox="0 0 24 24"
+                          stroke="currentColor"
+                          strokeWidth={2}
+                          aria-hidden
+                        >
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                          />
+                        </svg>
+                      ) : (
+                        <svg
+                          fill="none"
+                          viewBox="0 0 24 24"
+                          stroke="currentColor"
+                          strokeWidth={2}
+                          aria-hidden
+                        >
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
+                          />
+                        </svg>
+                      )}
+                    </button>
+                    {lifeExportMessage ? (
+                      <span className={cs.lifeExportHint}>
+                        {lifeExportMessage}
+                      </span>
+                    ) : null}
+                  </div>
+                </div>
+              ) : (
+                <div
+                  className={cs.chipRow}
+                  role="group"
+                  aria-label={locale === 'zh' ? '年份' : 'Year'}
+                >
+                  {availableYears.map((year) => (
+                    <button
+                      key={year}
+                      type="button"
+                      className={`${cs.filterChip} ${selectedYear === year ? cs.filterChipActive : ''}`}
+                      onClick={() =>
+                        setSelectedYear(selectedYear === year ? null : year)
+                      }
+                    >
+                      {year}
+                    </button>
+                  ))}
+                </div>
+              )
             ) : null}
           </>
         ) : (
@@ -1288,38 +1542,120 @@ const ActivityListInner: React.FC<
       {interval === 'life' && (
         <div className={cs.lifeContainer}>
           {embedded ? null : (
-            <div className={styles.yearSelector}>
-              {availableYears.map((year) => (
+            <div
+              className={`${styles.yearSelector} ${styles.chipRowWithExport}`}
+              data-export-hidden
+            >
+              <div className={styles.chipRowYears}>
+                {availableYears.map((year) => (
+                  <button
+                    key={year}
+                    className={`${styles.yearButton} ${selectedYear === year ? styles.yearButtonActive : ''}`}
+                    onClick={() =>
+                      setSelectedYear(selectedYear === year ? null : year)
+                    }
+                  >
+                    {year}
+                  </button>
+                ))}
+              </div>
+              <div className={styles.lifeExportTrailing}>
                 <button
-                  key={year}
-                  className={`${styles.yearButton} ${selectedYear === year ? styles.yearButtonActive : ''}`}
-                  onClick={() =>
-                    setSelectedYear(selectedYear === year ? null : year)
+                  type="button"
+                  className={styles.lifeExportIconBtn}
+                  onClick={handleLifeExport}
+                  disabled={lifeExporting}
+                  data-export-hidden
+                  title={
+                    locale === 'zh' ? '下载 Life 图片' : 'Download Life image'
+                  }
+                  aria-label={
+                    locale === 'zh' ? '下载 Life 图片' : 'Download Life image'
                   }
                 >
-                  {year}
+                  {lifeExporting ? (
+                    <svg
+                      className={styles.lifeExportIconSpin}
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={2}
+                      aria-hidden
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                      />
+                    </svg>
+                  ) : (
+                    <svg
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={2}
+                      aria-hidden
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
+                      />
+                    </svg>
+                  )}
                 </button>
-              ))}
+                {lifeExportMessage ? (
+                  <span className={styles.lifeExportHint}>
+                    {lifeExportMessage}
+                  </span>
+                ) : null}
+              </div>
             </div>
           )}
-          <div className={embedded ? cs.lifeSvgWrap : undefined}>
-            <Suspense fallback={<div>Loading SVG...</div>}>
-              {SelectedYearSvg ? (
-                <SelectedYearSvg className={cs.yearSummarySvg} />
-              ) : (
-                <>
-                  {(sportType === 'running' || sportType === 'Run') && (
-                    <RunningSvg />
-                  )}
-                  {sportType === 'walking' && <WalkingSvg />}
-                  {sportType === 'hiking' && <HikingSvg />}
-                  {sportType === 'cycling' && <CyclingSvg />}
-                  {sportType === 'swimming' && <SwimmingSvg />}
-                  {sportType === 'skiing' && <SkiingSvg />}
-                  {sportType === 'all' && <AllSvg />}
-                </>
-              )}
-            </Suspense>
+          <div
+            ref={lifeCaptureRef}
+            className={embedded ? cs.lifeSvgWrap : styles.lifeSvgWrap}
+          >
+            <SvgTitleTipHost key={`${selectedYear ?? 'life'}-${sportType}`}>
+              <Suspense
+                fallback={
+                  <div
+                    className={embedded ? cs.embedPending : undefined}
+                    role="status"
+                    aria-live="polite"
+                    style={
+                      embedded
+                        ? undefined
+                        : {
+                            minHeight: 160,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            color: 'var(--color-run-table-thead)',
+                          }
+                    }
+                  >
+                    {LOADING_TEXT}
+                  </div>
+                }
+              >
+                {SelectedYearSvg ? (
+                  <SelectedYearSvg className={cs.yearSummarySvg} />
+                ) : (
+                  <>
+                    {(sportType === 'running' || sportType === 'Run') && (
+                      <RunningSvg />
+                    )}
+                    {sportType === 'walking' && <WalkingSvg />}
+                    {sportType === 'hiking' && <HikingSvg />}
+                    {sportType === 'cycling' && <CyclingSvg />}
+                    {sportType === 'swimming' && <SwimmingSvg />}
+                    {sportType === 'skiing' && <SkiingSvg />}
+                    {sportType === 'all' && <AllSvg />}
+                  </>
+                )}
+              </Suspense>
+            </SvgTitleTipHost>
           </div>
         </div>
       )}

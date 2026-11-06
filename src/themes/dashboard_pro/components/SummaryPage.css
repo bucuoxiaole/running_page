@@ -1,7 +1,16 @@
-/* Dashboard Summary embed only — scoped under .summary-page-root.
-   Do not put these rules into classic ActivityList CSS modules. */
+/* Dashboard Summary — mock-aligned warm paper + classic Life embed tokens */
 
 .summary-page-root {
+  color: var(--color-text);
+  background-color: transparent;
+  overscroll-behavior-y: contain;
+  font-family: var(--font-sans);
+  font-optical-sizing: auto;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  /* ActivityList embed (Life) token bridge */
   --color-summary-fg: var(--color-text);
   --color-summary-accent: var(--color-accent);
   --color-summary-accent-hover: color-mix(
@@ -19,23 +28,8 @@
   --color-summary-radius: var(--radius-xl);
   --color-summary-chip-radius: 9999px;
   --color-summary-card-shadow: var(--shadow-card);
-  --color-summary-card-hover-border: var(--color-border);
-  --color-summary-card-hover-bg: var(--color-card);
-  --color-summary-card-lift: 5px;
   --color-summary-chip-bg: var(--color-sunken);
   --color-summary-chip-fg: var(--color-muted);
-  --color-summary-title-size: 1.125rem;
-  --color-summary-home-bg: color-mix(
-    in srgb,
-    var(--color-accent) 10%,
-    transparent
-  );
-  --color-summary-home-border: color-mix(
-    in srgb,
-    var(--color-accent) 40%,
-    transparent
-  );
-
   --color-brand: var(--color-accent);
   --color-primary: var(--color-accent);
   --color-secondary: var(--color-accent);
@@ -46,155 +40,196 @@
   --color-run-table-thead: var(--color-muted);
   --color-run-row-hover-background: var(--color-card);
   --color-activity-card: var(--color-border);
-  --color-scrollbar-thumb: color-mix(
-    in srgb,
-    var(--color-text) 22%,
-    transparent
-  );
-  --color-scrollbar-thumb-hover: color-mix(
-    in srgb,
-    var(--color-text) 40%,
-    transparent
-  );
-  --color-summary-scrollbar: color-mix(
-    in srgb,
-    var(--color-text) 22%,
-    transparent
-  );
   --svg-color-inactive-cell: var(--color-border);
   --svg-color-active-cell: var(--color-accent);
   --svg-special-color: var(--color-run);
   --svg-special-color2: var(--color-accent);
+}
 
+.summary-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+@media (min-width: 900px) {
+  .summary-layout {
+    display: grid;
+    grid-template-columns: 1fr 380px;
+    gap: 16px;
+    align-items: start;
+  }
+
+  .summary-list {
+    margin-top: 0 !important;
+  }
+}
+
+.summary-page-root .summary-hero,
+.summary-page-root .summary-list {
+  border-radius: var(--radius-xl);
+}
+
+.summary-life-classic {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
   color: var(--color-text);
-  background-color: var(--color-bg);
-  overscroll-behavior-y: contain;
-  -webkit-user-select: none;
-  user-select: none;
-  -webkit-touch-callout: none;
-  -webkit-tap-highlight-color: transparent;
-  /* Match dashboard_pro body (CJK-aware stack in index.css --font-sans). */
-  font-family: var(--font-sans);
-  font-optical-sizing: auto;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+  background: transparent;
 }
 
-.dark .summary-page-root {
-  --color-summary-accent-hover: color-mix(
-    in srgb,
-    var(--color-accent) 78%,
-    #fff
-  );
-  --color-summary-chart-bg: color-mix(
-    in srgb,
-    var(--color-card) 88%,
-    var(--color-bg)
-  );
-  --color-summary-card-hover-bg: var(--color-card);
-  --color-scrollbar-thumb-hover: color-mix(
-    in srgb,
-    var(--color-text) 45%,
-    transparent
-  );
-  --color-summary-scrollbar: color-mix(
-    in srgb,
-    var(--color-text) 28%,
-    transparent
-  );
+.scrollbar-none {
+  scrollbar-width: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
 }
 
-.summary-page-root .svg-color-bg {
+/* Month-of-Life / year SVGs: follow dashboard_pro light/dark tokens.
+ * Targets stable global SVG class hooks / fill attrs (not CSS-module locals). */
+.summary-life-classic .svg-color-bg,
+.summary-life-classic svg [fill='#222222'],
+.summary-life-classic svg [fill='#222'],
+.summary-life-classic svg [fill='#1a1a1a'] {
   fill: var(--color-card);
 }
-
-.summary-page-root .svg-color-inactive-cell {
+.summary-life-classic .svg-color-inactive-cell,
+.summary-life-classic svg [fill='#444444'],
+.summary-life-classic svg [fill='#444'] {
   fill: var(--color-border);
 }
-
-.summary-page-root .svg-color-active-cell {
-  fill: var(--svg-color-active-cell);
+.summary-life-classic .svg-color-active-cell,
+.summary-life-classic svg [fill='#4dd2ff'] {
+  fill: var(--color-accent);
+}
+.summary-life-classic .svg-color-text,
+.summary-life-classic .github-svg text,
+.summary-life-classic .grid-svg text,
+.summary-life-classic .year-svg text,
+.summary-life-classic svg text {
+  fill: var(--color-muted);
+}
+.summary-life-classic .svg-special-color {
+  fill: var(--svg-special-color, var(--color-run));
+}
+.summary-life-classic .svg-special-color2 {
+  fill: var(--svg-special-color2, var(--color-accent));
 }
 
-.summary-page-root .svg-special-color {
-  fill: var(--svg-special-color);
-}
-
-.summary-page-root .svg-special-color2 {
-  fill: var(--svg-special-color2);
-}
-
-.summary-page-root .svg-color-text {
-  fill: var(--color-text);
-}
-
-/* Cap Life / year summary SVGs in dashboard Summary embed (classic stays full). */
+/* Life SVG fills the bordered wrap; wrap itself is min(100%, 680px) + centered. */
 .summary-page-root [class*='yearSummarySvg'],
 .summary-page-root [class*='lifeContainer'] > svg,
-.summary-page-root [class*='lifeContainer'] svg {
-  width: min(100%, 680px) !important;
+.summary-page-root [class*='lifeContainer'] svg,
+.summary-life-classic [class*='yearSummarySvg'],
+.summary-life-classic [class*='lifeContainer'] > svg,
+.summary-life-classic [class*='lifeContainer'] svg {
+  width: 100% !important;
   height: auto !important;
   max-height: none;
 }
 
-/* Classic-like float on real hover; no purple selection ring.
-   Touch devices skip :hover so sticky purple borders don't stick after tap. */
-.summary-page-root [class*='activityCard'] {
-  -webkit-user-select: none;
-  user-select: none;
-  -webkit-tap-highlight-color: transparent;
-  transition:
-    transform 0.3s,
-    box-shadow 0.3s;
-}
-
-@media (hover: hover) and (pointer: fine) {
-  .summary-page-root [class*='activityCard']:hover {
-    transform: translateY(calc(var(--color-summary-card-lift, 5px) * -1));
-    border-color: var(--color-activity-card);
-    background-color: var(--color-run-row-hover-background);
-    box-shadow: 0 6px 16px color-mix(in srgb, #000 18%, transparent);
-  }
-}
-
-.summary-page-root [class*='chart'] {
-  position: relative;
-  touch-action: manipulation;
-  overflow: visible;
-}
-
-/* Day flip back: fill card with route preview */
-.summary-page-root [class*='routeContainer'] {
-  min-height: 0;
-  width: 100%;
-  padding: 6px;
-}
-
-.summary-page-root [class*='cardBack'] [class*='routePreview'] {
-  width: 100%;
-  height: 100%;
-  min-height: 0;
-}
-
-.summary-page-root [class*='cardBack'] [class*='routeSvg'] {
-  width: 100%;
-  height: 100%;
-  max-width: 100%;
-  max-height: 100%;
-}
-
-.summary-page-root [class*='lifeContainer'] {
+.summary-page-root [class*='lifeContainer'],
+.summary-life-classic [class*='lifeContainer'] {
   min-height: 120px;
 }
 
-/* rc-virtual-list keeps its thumb visible for 3s after the pointer moves.
-   Hide as soon as the pointer leaves the list; show only while scrolling. */
-.summary-page-root .rc-virtual-list-scrollbar {
-  visibility: hidden !important;
+/* Mobile Life: allow vertical scroll inside the host shell */
+@media (max-width: 899px) {
+  .summary-life-classic:not(.summary-day-classic) {
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+  }
 }
 
-.summary-page-root .rc-virtual-list:hover .rc-virtual-list-scrollbar-visible,
-.summary-page-root .rc-virtual-list-scrollbar:hover {
-  visibility: visible !important;
+/* Desktop Life: clip to the flex viewport; inner .lifeContainer may still scroll */
+@media (min-width: 900px) {
+  .summary-life-classic:not(.summary-day-classic) {
+    overflow: hidden;
+  }
+}
+
+/* Top period tabs (年/月/周/日/Life) — single selected language */
+.summary-period-tabs {
+  display: flex;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-bottom: 12px;
+}
+
+.summary-period-tab {
+  cursor: pointer;
+  border: none;
+  border-radius: 9999px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.25;
+  background: transparent;
+  color: var(--color-muted);
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.summary-period-tab:hover {
+  color: var(--color-text);
+}
+
+.summary-period-tab.is-active {
+  background: var(--color-accent);
+  color: #fff;
+}
+
+.summary-period-tab.is-active:hover {
+  color: #fff;
+}
+
+/* Month/week period chips: same selected fill as 日/Life tabs + year chips */
+.summary-period-chip {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  cursor: pointer;
+  border: none;
+  border-radius: 9999px;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.25;
+  white-space: nowrap;
+  background: transparent;
+  color: var(--color-muted);
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.summary-period-chip:hover {
+  color: var(--color-text);
+}
+
+.summary-period-chip.is-active {
+  background: var(--color-accent);
+  color: #fff;
+}
+
+.summary-period-chip.is-active:hover {
+  color: #fff;
+}
+
+/* Period chips row chrome lives in ChipScrollRow (hidden scrollbar + edge fades).
+ * `.summary-period-chips` remains as a root hook class for spacing utilities. */
+
+/* In-panel wait for day/Life embed — never covers page chrome / period tabs */
+.summary-embed-pending {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: center;
+  min-height: 10rem;
+  padding: 1.5rem;
+  color: var(--color-muted);
+  font-size: 13px;
 }

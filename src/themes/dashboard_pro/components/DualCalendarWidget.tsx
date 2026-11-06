@@ -372,7 +372,22 @@ export function DualCalendarWidget({
     setViewMonth(d.getMonth());
     setPickerOpen(false);
   };
-  const currentMonthLabel = locale === 'zh' ? '本月' : 'This month';
+  // Same breakpoint as map dock / mobile chrome (≤1023px).
+  const [isCompactChrome, setIsCompactChrome] = useState(() =>
+    typeof window !== 'undefined'
+      ? window.matchMedia('(max-width: 1023px)').matches
+      : true
+  );
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 1023px)');
+    const sync = () => setIsCompactChrome(mq.matches);
+    sync();
+    mq.addEventListener('change', sync);
+    return () => mq.removeEventListener('change', sync);
+  }, []);
+  // Mobile EN short; desktop EN full. ZH is short either way.
+  const currentMonthLabel =
+    locale === 'zh' ? '本月' : isCompactChrome ? 'This mo.' : 'This month';
 
   return (
     <div className="card flex w-full min-w-0 flex-col p-5 md:p-6">
@@ -406,6 +421,8 @@ export function DualCalendarWidget({
               <button
                 type="button"
                 onClick={goToCurrentMonth}
+                aria-label={locale === 'zh' ? '回本月' : 'This month'}
+                title={locale === 'zh' ? '回本月' : 'This month'}
                 className="cursor-pointer rounded-md px-1.5 text-[11px] font-medium whitespace-nowrap text-[var(--color-text)] hover:bg-[var(--color-card)]"
               >
                 {currentMonthLabel}
