@@ -69,15 +69,15 @@ github_url: 'https://github.com/viazure/running_page'
 
 goals:
   all:
-    yearly: 1000
-    monthly: 100
-    weekly: 25
+    yearly: 400
+    monthly: 40
+    weekly: 15
     unit: distance
 
   Run:
-    yearly: 1000
-    monthly: 100
-    weekly: 25
+    yearly: 400
+    monthly: 40
+    weekly: 15
     unit: distance
 
 # ── 分段分析（公开默认；个人 LTHR/FTP 用环境变量 VITE_LTHR / VITE_FTP）──────
