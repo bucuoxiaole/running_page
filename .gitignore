@@ -26,7 +26,3 @@ route.png
 route.svg
 
 .env
-
-# local preview / Playwright scratch (do not commit)
-_preview/
-

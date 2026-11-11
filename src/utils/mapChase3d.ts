@@ -217,8 +217,10 @@ export function createMapOrbitController() {
   };
 
   /** Pointer / wheel / drag: cancel orbit (same as before). */
-  const handleUserInput = (event: { originalEvent?: Event }) => {
-    if (!running || !event.originalEvent) return;
+  const handleUserInput = (payload?: unknown) => {
+    if (!running) return;
+    if (!(payload as { originalEvent?: Event } | undefined)?.originalEvent)
+      return;
     stop();
   };
 
@@ -226,9 +228,14 @@ export function createMapOrbitController() {
    * Zoom +/- buttons call map.zoomIn/Out({}, { originalEvent }), which never
    * hits map mousedown/wheel. Listen on zoomstart and soft-stop so the ease
    * continues (wheel already stops via the wheel listener above).
+   *
+   * Mapbox types `zoomstart` as `{ originalEvent? } | void`; `EventOf` collapses
+   * that union to `{ type, target }`, so read the field from `unknown`.
    */
-  const handleUserZoom = (event: { originalEvent?: Event }) => {
-    if (!running || !event.originalEvent) return;
+  const handleUserZoom = (payload?: unknown) => {
+    if (!running) return;
+    if (!(payload as { originalEvent?: Event } | undefined)?.originalEvent)
+      return;
     stop({ keepCameraMotion: true });
   };
 
@@ -406,15 +413,21 @@ export function setChaseHighlightLine(
       coordinates: coords.length >= 2 ? coords : [],
     },
   };
-  if (m.getSource(HIGHLIGHT_SOURCE)) {
-    (m.getSource(HIGHLIGHT_SOURCE) as mapboxgl.GeoJSONSource).setData(data);
-    if (m.getLayer(HIGHLIGHT_LAYER)) {
-      m.setPaintProperty(HIGHLIGHT_LAYER, 'line-color', color);
-      m.setPaintProperty(HIGHLIGHT_LAYER, 'line-width', lineWidth);
-    }
+  const src = m.getSource(HIGHLIGHT_SOURCE) as
+    mapboxgl.GeoJSONSource | undefined;
+  if (src) {
+    src.setData(data);
+  } else {
+    m.addSource(HIGHLIGHT_SOURCE, { type: 'geojson', data });
+  }
+  if (m.getLayer(HIGHLIGHT_LAYER)) {
+    m.setPaintProperty(HIGHLIGHT_LAYER, 'line-color', color);
+    m.setPaintProperty(HIGHLIGHT_LAYER, 'line-width', lineWidth);
+    m.setPaintProperty(HIGHLIGHT_LAYER, 'line-opacity', 1);
     return;
   }
-  m.addSource(HIGHLIGHT_SOURCE, { type: 'geojson', data });
+  // Source can survive a partial teardown / style glitch without its layer —
+  // never return early or the trail stays invisible with data and no paint.
   m.addLayer({
     id: HIGHLIGHT_LAYER,
     type: 'line',
@@ -557,14 +570,14 @@ type ChaseStartArgs = {
 
 /**
  * Card height ease: 480ms cubic-bezier(0.34, 1.45, 0.64, 1) (see .route-map-play-spring).
- * Hosts keep .route-map-play-surface at play height for the whole grow/shrink clip
- * (overflow:hidden on the outer shell). Resize once on play start, again at settle;
- * on exit, drop play-sizing then resize at PLAYBACK_LAYOUT_EXIT_RESIZE_MS.
- * Mid-animation resize blanks the WebGL canvas.
+ *
+ * Values live in `./playbackLayout` (dependency-free) and are re-exported here so
+ * existing map-side imports keep working without pulling that module elsewhere.
  */
-export const PLAYBACK_LAYOUT_SETTLE_MS = 520;
-/** After exit height clip: surface unsize + one resize (settle + React/layout slack). */
-export const PLAYBACK_LAYOUT_EXIT_RESIZE_MS = PLAYBACK_LAYOUT_SETTLE_MS + 80;
+export {
+  PLAYBACK_LAYOUT_SETTLE_MS,
+  PLAYBACK_LAYOUT_EXIT_RESIZE_MS,
+} from './playbackLayout';
 
 type PlaybackSession = {
   map: mapboxgl.Map;
@@ -626,6 +639,7 @@ export function createMapChaseController() {
   let compassIdleLabel = '';
   let compassTitlesLive: { lock: string; follow: string } | null = null;
   let onCompassClick: ((event: Event) => void) | null = null;
+  let onCompassTouchBlock: ((event: TouchEvent) => void) | null = null;
   let currentZoom = 16.5;
   let currentPitch = ORBIT_PITCH;
   /** Extra zoom-out (positive = farther). Phone 9:16 cover reads closer. */
@@ -780,16 +794,29 @@ export function createMapChaseController() {
   const unbindCompass = () => {
     if (compassBtn && onCompassClick) {
       compassBtn.removeEventListener('click', onCompassClick, true);
+      compassBtn.removeEventListener('touchend', onCompassClick, true);
+      if (onCompassTouchBlock) {
+        compassBtn.removeEventListener('touchstart', onCompassTouchBlock, true);
+      }
       compassBtn.classList.remove('is-bearing-locked');
       if (compassIdleLabel) setCompassTooltip(compassIdleLabel);
     }
     compassBtn = null;
     onCompassClick = null;
+    onCompassTouchBlock = null;
     compassIdleLabel = '';
     compassTitlesLive = null;
     bearingLocked = false;
   };
 
+  /**
+   * Mapbox NavigationControl attaches a rotate/pitch drag helper on the compass
+   * (touchstart → drag; touchend synthesizes click only if move < 10px).
+   * During chase, jumpTo updates bearing every frame, so a finger tap often
+   * exceeds that tolerance — click never fires. Unlock still worked when a
+   * clean click landed; lock felt impossible. Block Mapbox touchstart and
+   * toggle on our own touchend/click instead.
+   */
   const bindCompass = (
     map: mapboxgl.Map,
     titles: { lock: string; follow: string }
@@ -808,8 +835,16 @@ export function createMapChaseController() {
         : '') ||
       btn.title ||
       '';
-    onCompassClick = (event) => {
+    let lastToggleAt = 0;
+    const toggleLock = (event: Event) => {
       if (!running) return;
+      const now = performance.now();
+      if (now - lastToggleAt < 350) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+      }
+      lastToggleAt = now;
       event.preventDefault();
       event.stopImmediatePropagation();
       bearingLocked = !bearingLocked;
@@ -823,6 +858,18 @@ export function createMapChaseController() {
       syncCompassLock(titles);
       callbacks.onBearingLockChange?.(bearingLocked);
     };
+    onCompassTouchBlock = (event) => {
+      if (!running) return;
+      // Stop Mapbox's compass MouseRotateWrapper before it starts a drag.
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    };
+    onCompassClick = toggleLock;
+    btn.addEventListener('touchstart', onCompassTouchBlock, {
+      capture: true,
+      passive: false,
+    });
+    btn.addEventListener('touchend', onCompassClick, true);
     btn.addEventListener('click', onCompassClick, true);
     syncCompassLock(titles);
   };
@@ -1115,7 +1162,8 @@ export function createMapChaseController() {
   };
 
   const setZoomOutExtra = (extra: number) => {
-    zoomOutExtra = Math.max(0, extra);
+    // Negative = zoom in (needed when export CSS box is larger than on-screen).
+    zoomOutExtra = Math.min(4, Math.max(-4, extra));
     if (!session || !running) return;
     if (cameraMode === '2d') {
       currentZoom = zoom2dInit();

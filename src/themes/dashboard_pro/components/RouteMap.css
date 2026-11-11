@@ -12,12 +12,53 @@
     visibility 0.28s ease;
 }
 
-.route-map-fs-root.is-chrome-idle .mapboxgl-ctrl-top-right,
+/* While not chasing, idle-hide the whole top-right stack.
+ * During chase, skip the blanket rule: parent opacity:0 cannot be undone by
+ * children, and pointer-events:none on the stack would block taps. Touch has
+ * no hover to reveal chrome, so keep the compass hittable (see below). */
+.route-map-fs-root.is-chrome-idle:not(.is-playing) .mapboxgl-ctrl-top-right,
 .route-map-fs-root.is-chrome-idle .route-map-top-left,
 .route-map-fs-root.is-chrome-idle .route-map-recenter {
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
+}
+
+/*
+ * Chase + chrome idle: keep NavigationControl compass visible/tappable.
+ * Zoom / play / fullscreen still idle-hide; top-left + recenter already hidden.
+ */
+.route-map-fs-root.is-playing.is-chrome-idle
+  .mapboxgl-ctrl-top-right
+  > .mapboxgl-ctrl-group:not(:has(.mapboxgl-ctrl-compass)) {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.route-map-fs-root.is-playing.is-chrome-idle .mapboxgl-ctrl-zoom-in,
+.route-map-fs-root.is-playing.is-chrome-idle .mapboxgl-ctrl-zoom-out {
+  /* Collapse so the compass sits alone in the nav pill */
+  display: none;
+}
+
+.route-map-fs-root.is-playing.is-chrome-idle
+  .mapboxgl-ctrl-group:has(.mapboxgl-ctrl-compass),
+.route-map-fs-root.is-playing.is-chrome-idle .mapboxgl-ctrl-compass {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+/* Chase: compass must win touch hit-testing over the WebGL canvas. */
+.route-map-fs-root.is-playing .mapboxgl-ctrl-group:has(.mapboxgl-ctrl-compass) {
+  position: relative;
+  z-index: 6;
+  pointer-events: auto;
+}
+
+.route-map-fs-root.is-playing .mapboxgl-ctrl-compass {
+  pointer-events: auto;
+  touch-action: manipulation;
 }
 
 /* Match Mapbox zoom/compass cell (32×32) so hover fill covers the whole button. */
@@ -751,4 +792,19 @@
 /* Chase: compass lock = freeze bearing (no route-follow yaw) */
 .mapboxgl-ctrl-group button.mapboxgl-ctrl-compass.is-bearing-locked {
   box-shadow: inset 0 0 0 2px var(--color-accent, #f97316);
+}
+
+/* Tracks page · left column: keep its own scroll invisible.
+   The column can scroll when the viewport is too short for stats + map, but a
+   visible bar there reads as "misplaced" — it visually belongs to the track
+   wall on the right. Mobile keeps `display: contents`, so these only apply on
+   the desktop breakpoint where the column is a flex box. */
+@media (min-width: 1024px) {
+  .tracks-left-column {
+    scrollbar-width: none;
+  }
+
+  .tracks-left-column::-webkit-scrollbar {
+    display: none;
+  }
 }

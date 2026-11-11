@@ -8,6 +8,7 @@ import {
   formatPace,
 } from '@/hooks/useActivities';
 import { useLocale } from '@/hooks/useLocale';
+import { ChipScrollRow } from './ChipScrollRow';
 
 interface HeatmapProps {
   activities: Activity[];
@@ -27,7 +28,7 @@ function toDisplayType(type: string): 'Run' | 'Ride' | 'Hike' | 'Training' {
   return 'Training';
 }
 
-const EMPTY_CELL = 'var(--color-sunken)';
+const EMPTY_CELL = 'var(--color-cell, var(--color-sunken))';
 
 function accentScale(accent: string): string[] {
   return [
@@ -39,7 +40,7 @@ function accentScale(accent: string): string[] {
 }
 
 const TYPE_PALETTES: Record<string, string[]> = {
-  Run: accentScale('var(--color-run)'),
+  Run: accentScale('var(--color-amber, var(--color-run))'),
   Ride: accentScale('#4f7ce0'),
   Hike: accentScale('#22c55e'),
   Training: accentScale('#ec4899'),
@@ -303,7 +304,7 @@ export function ContributionHeatmap({
   }, [activities, selectedYear, isGym]);
 
   const gymTypeColors: Record<string, string> = {
-    WeightTraining: '#e8663d',
+    WeightTraining: 'var(--color-amber)',
     Workout: '#c026d3',
     StairStepper: '#4f7ce0',
     WaterSport: '#06b6d4',
@@ -405,8 +406,12 @@ export function ContributionHeatmap({
       <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <h2 className="shrink-0 text-lg font-semibold">{heatmapTitle}</h2>
         <div className="flex min-w-0 items-center gap-2">
-          {/* Year tabs — swipe/scroll like ActivityLog */}
-          <div className="-mx-1 flex min-w-0 flex-1 flex-nowrap items-center gap-2 overflow-x-auto px-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          {/* Year tabs — ChipScrollRow: hidden bar + edge fades + desktop arrows */}
+          <ChipScrollRow
+            className="min-w-0 flex-1"
+            contentClassName="gap-2"
+            fadeFrom="var(--color-card)"
+          >
             <button
               type="button"
               onClick={() => handleSelectYear('all')}
@@ -432,7 +437,7 @@ export function ContributionHeatmap({
                 {y}
               </button>
             ))}
-          </div>
+          </ChipScrollRow>
 
           {/* Export button */}
           <button
@@ -566,7 +571,7 @@ export function ContributionHeatmap({
                     return (
                       <div
                         key={di}
-                        className="aspect-square min-h-0 w-full cursor-pointer rounded-[1px] transition-colors hover:ring-1 hover:ring-[var(--color-muted)] sm:rounded-sm"
+                        className="aspect-square min-h-0 w-full cursor-pointer rounded-[2px] transition-colors hover:ring-1 hover:ring-[var(--color-muted)]"
                         style={{ backgroundColor: bgColor }}
                         title={titleText}
                         onClick={() => {
@@ -595,7 +600,7 @@ export function ContributionHeatmap({
                 {TYPE_PALETTES[tp].map((c, i) => (
                   <span
                     key={i}
-                    className="inline-block h-2.5 w-2.5 rounded-sm"
+                    className="inline-block h-2.5 w-2.5 rounded-[2px]"
                     style={{ backgroundColor: c }}
                   />
                 ))}
@@ -611,7 +616,7 @@ export function ContributionHeatmap({
             {[0.1, 0.35, 0.6, 0.82, 1].map((ratio, i) => (
               <div
                 key={i}
-                className="h-3 w-3 rounded-sm"
+                className="h-3 w-3 rounded-[2px]"
                 style={{
                   backgroundColor: getColor(
                     ratio * (yearData[0]?.max || 1),

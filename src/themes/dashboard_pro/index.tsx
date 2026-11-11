@@ -3,7 +3,9 @@ import {
   lazy,
   startTransition,
   Suspense,
+  useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -13,7 +15,6 @@ import {
   useFilteredActivities,
   getAvailableYears,
   extractProvince,
-  getActivityData,
 } from '@/hooks/useActivities';
 import { useTheme } from '@/hooks/useTheme';
 import { useLocale } from '@/hooks/useLocale';
@@ -32,12 +33,25 @@ import {
   PRIVACY_MODE,
   PRIVACY_ANONYMOUS_TITLES,
   GITHUB_URL,
+  DASHBOARD_PRO_MODULES,
+  DASHBOARD_PRO_SHOW_LATEST,
 } from '@/core/config';
 import { CAN_PRIVACY_UNLOCK } from '@/core/privacyUnlock';
 import { DashboardContentSkeleton } from '@/components/PageSkeleton';
-import { TrendChart } from './components/TrendChart';
+import { TracksPageSkeleton } from './components/TracksPageSkeleton';
+import { MonthGlance } from './components/MonthGlance';
 import { MapDockFab } from './components/MapDockFab';
-import { useMobileMapDock } from './hooks/useMobileMapDock';
+import { LatestStrip } from './components/LatestStrip';
+import {
+  playbackMapHeightPx,
+  useMobileMapDock,
+} from './hooks/useMobileMapDock';
+import { PLAYBACK_LAYOUT_SETTLE_MS } from '@/utils/playbackLayout';
+import { useActivitiesWithTracks } from './hooks/useActivitiesWithTracks';
+import {
+  getProActivityData,
+  preloadProActivityData,
+} from './hooks/useProActivities';
 
 const loadRouteMap = () =>
   import('./components/RouteMap').then((m) => ({ default: m.RouteMap }));
@@ -58,11 +72,33 @@ const RunAnalysisLauncher = lazy(() =>
   }))
 );
 
-// Prefetch secondary pages so navigating home → summary/tracks does not flash Suspense.
-void loadSummaryPage();
-void loadTracksPage();
-void loadRouteMap();
-void loadChinaMap();
+/**
+ * Prefetch secondary pages so home → summary/tracks does not flash Suspense.
+ * Deferred to idle time: the first paint must not compete with map/chart chunks.
+ * Falls back to a timeout where requestIdleCallback is unavailable (Safari).
+ */
+function scheduleIdlePrefetch(): void {
+  if (typeof window === 'undefined') return;
+  const run = () => {
+    void loadSummaryPage();
+    void loadTracksPage();
+  };
+  const ric = (
+    window as Window & {
+      requestIdleCallback?: (
+        cb: () => void,
+        opts?: { timeout: number }
+      ) => number;
+    }
+  ).requestIdleCallback;
+  if (typeof ric === 'function') {
+    ric(run, { timeout: 2500 });
+    return;
+  }
+  window.setTimeout(run, 1200);
+}
+
+scheduleIdlePrefetch();
 
 type Page = 'home' | 'tracks' | 'summary';
 
@@ -74,11 +110,13 @@ function MapFallback({
 }: {
   className?: string;
 }) {
+  const { t } = useLocale();
   return (
     <div
-      className={`card flex items-center justify-center text-sm text-[var(--color-muted)] ${className}`}
+      className={`card flex flex-col items-center justify-center gap-1 px-4 text-center text-sm text-[var(--color-muted)] ${className}`}
     >
-      …
+      <span>{t('mapUnavailable')}</span>
+      <span className="text-[11px]">{t('mapUnavailableHint')}</span>
     </div>
   );
 }
@@ -88,18 +126,33 @@ function DashboardProContent({
   dark,
   filter,
   onNavigateHome,
+  onFabClearanceChange,
 }: {
   page: Page;
   dark: boolean;
   filter: 'all';
   onNavigateHome: () => void;
+  /** Mobile FAB clearance for the home footer (0 / one / two stacked). */
+  onFabClearanceChange?: (pad: 'none' | 'one' | 'two') => void;
 }) {
-  const activities = getActivityData() as Activity[];
+  const activities = getProActivityData();
+  /**
+   * Lite payload has no polylines; the sidecar merges geometry in after first
+   * paint for the map / track wall / calendar previews.
+   */
+  const activitiesWithTracks = useActivitiesWithTracks(activities);
   const isUnlocked = usePrivacyUnlock();
   const { locale } = useLocale();
   const years = getAvailableYears(activities);
   /** Default to the latest year that has data (falls back to ALL if none). */
   const [year, setYear] = useState<number | null>(() => years[0] ?? null);
+  /** Shared by DualCalendarWidget + MonthGlance so flipping months stays in sync. */
+  const [calYear, setCalYear] = useState(() => new Date().getFullYear());
+  const [calMonth, setCalMonth] = useState(() => new Date().getMonth());
+  const onCalViewChange = useCallback((y: number, m: number) => {
+    setCalYear(y);
+    setCalMonth(m);
+  }, []);
   const [selectedActivity, setSelectedActivity] = useState<Activity | null>(
     null
   );
@@ -107,8 +160,7 @@ function DashboardProContent({
   const [analysisOpen, setAnalysisOpen] = useState(false);
 
   const filtered = useFilteredActivities(activities, filter, year);
-  /** Fallback year for components that require a concrete calendar year (e.g. TrendChart). */
-  const chartYear = year ?? years[0] ?? FOOTER_YEAR;
+  const modules = DASHBOARD_PRO_MODULES;
   const privacyActive = PRIVACY_MODE && !isUnlocked;
   const useAnonymousTitles = privacyActive && PRIVACY_ANONYMOUS_TITLES;
   const activityTitle = (a: Activity) =>
@@ -121,21 +173,67 @@ function DashboardProContent({
     );
   }, [filtered, selectedProvince]);
 
+  /** Same filter, but with sidecar geometry for map rendering. */
+  const provinceFilteredTracks = useMemo(() => {
+    if (provinceFiltered === filtered) return activitiesWithTracks;
+    const byId = new Map(
+      activitiesWithTracks.map((a) => [a.run_id, a] as const)
+    );
+    return provinceFiltered.map((a) => byId.get(a.run_id) ?? a);
+  }, [provinceFiltered, filtered, activitiesWithTracks]);
+
   const allYears = year == null;
   const mapSlotRef = useRef<HTMLDivElement>(null);
   const mapPinRef = useRef<HTMLDivElement>(null);
+  const [mapPlaying, setMapPlaying] = useState(false);
+  // Keep play surface tall through exit settle (same as TracksPage / RouteMap).
+  const [playSurfaceSized, setPlaySurfaceSized] = useState(false);
+  const isPlaybackGrowViewport = () =>
+    typeof window !== 'undefined' &&
+    window.matchMedia('(max-width: 1023px)').matches;
+  useLayoutEffect(() => {
+    if (mapPlaying && isPlaybackGrowViewport()) setPlaySurfaceSized(true);
+  }, [mapPlaying]);
+  useEffect(() => {
+    if (mapPlaying) return;
+    const delay = isPlaybackGrowViewport() ? PLAYBACK_LAYOUT_SETTLE_MS : 0;
+    const t = window.setTimeout(() => setPlaySurfaceSized(false), delay);
+    return () => window.clearTimeout(t);
+  }, [mapPlaying]);
   const mapDock = useMobileMapDock(
     page === 'home',
     mapSlotRef,
     mapPinRef,
-    allYears ? 'all' : 'year'
+    allYears ? 'all' : 'year',
+    playSurfaceSized ? playbackMapHeightPx() : null
   );
+
+  // Keep footer FAB clearance in sync (padding lives under the copyright, not
+  // between the last card and the footer — that looked like a huge bottom gap).
+  useEffect(() => {
+    if (!onFabClearanceChange) return;
+    if (page !== 'home' || analysisOpen) {
+      onFabClearanceChange('none');
+      return;
+    }
+    const showDockFab = mapDock.showFab;
+    if (selectedActivity != null && showDockFab) onFabClearanceChange('two');
+    else if (selectedActivity != null || showDockFab)
+      onFabClearanceChange('one');
+    else onFabClearanceChange('none');
+  }, [
+    onFabClearanceChange,
+    page,
+    analysisOpen,
+    mapDock.showFab,
+    selectedActivity,
+  ]);
 
   if (page === 'tracks') {
     return (
-      <Suspense>
+      <Suspense fallback={<TracksPageSkeleton />}>
         <TracksPage
-          activities={activities}
+          activities={activitiesWithTracks}
           filter={filter}
           onSelectActivity={setSelectedActivity}
           onBack={onNavigateHome}
@@ -156,31 +254,58 @@ function DashboardProContent({
   }
 
   const activityLog = (
-    <ActivityLog
-      activities={filtered}
-      years={years}
-      year={year}
-      setYear={setYear}
-      selectedActivity={selectedActivity}
-      onSelectActivity={setSelectedActivity}
-      filter={filter}
-      getTitle={activityTitle}
-      pageSize={ACTIVITY_LOG_PAGE_SIZE}
-      variant="pro"
-    />
+    <>
+      {DASHBOARD_PRO_SHOW_LATEST ? (
+        <LatestStrip
+          activities={provinceFilteredTracks}
+          getTitle={activityTitle}
+          onSelectActivity={setSelectedActivity}
+          limit={3}
+        />
+      ) : null}
+      <ActivityLog
+        activities={provinceFilteredTracks}
+        years={years}
+        year={year}
+        setYear={setYear}
+        selectedActivity={selectedActivity}
+        onSelectActivity={setSelectedActivity}
+        filter={filter}
+        getTitle={activityTitle}
+        pageSize={ACTIVITY_LOG_PAGE_SIZE}
+        variant="pro"
+      />
+    </>
   );
 
   // Long document + viewport: slot is a plain placeholder (lockHeight).
   // Expanded map is always fixed via pinRef (Option A — no sticky).
   // No CSS transform on the map wrapper.
+  const routeMapNoTween =
+    mapDock.fillHeight || mapDock.lockHeight || mapDock.pinMotion != null;
+  const routeMapCardClass = mapDock.fillHeight
+    ? 'h-full shadow-lg transition-none [--card-shadow:var(--shadow-card-hover)]'
+    : [
+        routeMapNoTween ? 'transition-none' : '',
+        mapPlaying
+          ? 'h-[min(70vh,520px)] shadow-lg [--card-shadow:var(--shadow-card-hover)] md:h-[min(65vh,560px)] lg:h-[320px]'
+          : mapDock.active
+            ? 'h-[320px] shadow-lg [--card-shadow:var(--shadow-card-hover)] md:h-[320px]'
+            : 'h-[320px] [--card-shadow:var(--shadow-card-hover)] md:h-[320px] lg:[--card-shadow:var(--shadow-card)]',
+      ]
+        .filter(Boolean)
+        .join(' ');
+  // Match TracksPage: play height while chasing; never force 320px under
+  // lockHeight during play (that left the slot tall after stop). No height
+  // tween while dock fixed/handoff (Mapbox blanks).
   const routeMap = (
     <>
       <div
         ref={mapSlotRef}
         className={
           allYears
-            ? 'order-3 min-h-[220px] md:min-h-[260px] lg:order-none'
-            : 'order-3 lg:order-none lg:shrink-0'
+            ? 'order-4 min-h-[220px] md:min-h-[260px] lg:order-none'
+            : 'order-4 lg:order-none lg:shrink-0'
         }
         style={
           mapDock.lockHeight && mapDock.frame
@@ -196,24 +321,14 @@ function DashboardProContent({
             fallback={<MapFallback className="h-[220px] lg:h-[260px]" />}
           >
             <RouteMap
-              activities={provinceFiltered}
-              allActivities={activities}
+              activities={provinceFilteredTracks}
+              allActivities={activitiesWithTracks}
               selectedActivity={selectedActivity}
               dark={dark}
               lightsOff={privacyActive}
               onClearSelection={() => setSelectedActivity(null)}
-              className={
-                // No height tween while dock fixed/handoff (Mapbox blanks).
-                // In free flow keep play-spring (RouteMap skips it when
-                // className includes transition-none).
-                mapDock.fillHeight
-                  ? 'h-full shadow-lg transition-none [--card-shadow:var(--shadow-card-hover)]'
-                  : mapDock.lockHeight
-                    ? 'h-[280px] shadow-lg transition-none [--card-shadow:var(--shadow-card-hover)] md:h-[300px]'
-                    : mapDock.active
-                      ? 'h-[280px] shadow-lg [--card-shadow:var(--shadow-card-hover)] md:h-[300px]'
-                      : 'h-[280px] [--card-shadow:var(--shadow-card-hover)] md:h-[300px] lg:[--card-shadow:var(--shadow-card)]'
-              }
+              onPlaybackChange={setMapPlaying}
+              className={routeMapCardClass}
             />
           </Suspense>
         </div>
@@ -232,24 +347,28 @@ function DashboardProContent({
   );
 
   const calendar = (
-    <div className="order-4 min-w-0 overflow-hidden lg:order-none lg:shrink-0">
+    <div className="order-5 min-w-0 overflow-hidden lg:order-none lg:shrink-0">
       <DualCalendarWidget
-        activities={activities}
+        activities={activitiesWithTracks}
         selectedActivity={selectedActivity}
         onSelectActivity={setSelectedActivity}
+        viewYear={calYear}
+        viewMonth={calMonth}
+        onViewChange={onCalViewChange}
       />
     </div>
   );
 
-  const trend = (
+  const trend = modules.month_glance ? (
     <div
-      className={`order-7 flex min-w-0 flex-col lg:order-none ${
+      className={`order-8 flex min-w-0 flex-col lg:order-none ${
         allYears ? 'lg:shrink-0' : 'lg:min-h-0 lg:flex-1'
       }`}
     >
-      <TrendChart
-        activities={filtered}
-        year={chartYear}
+      <MonthGlance
+        activities={activities}
+        viewYear={calYear}
+        viewMonth={calMonth}
         className={
           allYears
             ? 'h-[260px]'
@@ -257,27 +376,14 @@ function DashboardProContent({
         }
       />
     </div>
-  );
+  ) : null;
 
   return (
-    <main
-      className="mx-auto max-w-[1400px] px-4 py-6 md:px-6"
-      // Reserve room for mobile map-dock / splits FABs (desktop: centered splits only).
-      style={(() => {
-        const showDockFab = mapDock.showFab && !analysisOpen;
-        const both = selectedActivity != null && showDockFab;
-        if (selectedActivity == null && !showDockFab) return undefined;
-        return {
-          paddingBottom: both
-            ? 'calc(7.5rem + env(safe-area-inset-bottom, 0px))'
-            : 'calc(4.5rem + env(safe-area-inset-bottom, 0px))',
-        };
-      })()}
-    >
+    <main className="mx-auto max-w-[1400px] px-4 py-6 md:px-6">
       {/*
-        Mobile order: Profile → Stats → sticky RouteMap → Calendar → ActivityLog
-        → ChinaMap → Yearly Distance → Heatmap (bottom).
-        Desktop, one year (2×2, each row stretches):
+        Mobile: Profile → Stats → Heatmap(under 连续) → RouteMap → Calendar
+        → ActivityLog → ChinaMap → Trend.
+        Desktop, one year (2x2, each row stretches):
           [Stats+Heatmap] [Profile + Map]
           [ActivityLog  ] [RouteMap+Calendar+Distance]
         Desktop, all years: one left column and one right column.
@@ -290,27 +396,34 @@ function DashboardProContent({
       >
         {/* Left: stats + heatmap, plus the log when every year is shown */}
         <div className="contents min-w-0 lg:col-start-1 lg:row-start-1 lg:flex lg:min-h-0 lg:flex-col lg:gap-6">
-          <div className="order-2 min-w-0 lg:order-none lg:shrink-0">
-            <StatsCards
-              activities={filtered}
-              allActivities={activities}
-              year={year}
-              filter={filter}
-              onSelectActivity={setSelectedActivity}
-              compact
-            />
-          </div>
-          <div className="order-9 min-w-0 overflow-hidden lg:order-none lg:shrink-0">
-            <ContributionHeatmap
-              activities={activities}
-              year={year}
-              filter={filter}
-              onSelectActivity={setSelectedActivity}
-              onYearChange={setYear}
-            />
-          </div>
+          {modules.weekly ||
+          modules.yearly_goal ||
+          modules.monthly_goal ||
+          modules.streak ? (
+            <div className="order-2 min-w-0 lg:order-none lg:shrink-0">
+              <StatsCards
+                activities={provinceFilteredTracks}
+                allActivities={activitiesWithTracks}
+                year={year}
+                filter={filter}
+                onSelectActivity={setSelectedActivity}
+                compact
+              />
+            </div>
+          ) : null}
+          {modules.heatmap ? (
+            <div className="order-3 min-w-0 overflow-hidden lg:order-none lg:shrink-0">
+              <ContributionHeatmap
+                activities={activitiesWithTracks}
+                year={year}
+                filter={filter}
+                onSelectActivity={setSelectedActivity}
+                onYearChange={setYear}
+              />
+            </div>
+          ) : null}
           {allYears ? (
-            <div className="order-5 flex min-w-0 flex-col overflow-hidden lg:order-none lg:min-h-0 lg:flex-1">
+            <div className="order-6 flex min-w-0 flex-col overflow-hidden lg:order-none lg:min-h-0 lg:flex-1">
               {activityLog}
             </div>
           ) : null}
@@ -324,7 +437,7 @@ function DashboardProContent({
         >
           <div className="order-1 min-w-0 overflow-hidden lg:order-none lg:shrink-0">
             <ProfileCard
-              activities={activities}
+              activities={activitiesWithTracks}
               filter={filter}
               getTitle={activityTitle}
               onSelectActivity={setSelectedActivity}
@@ -333,36 +446,38 @@ function DashboardProContent({
               showLocationStats
             />
           </div>
-          <div
-            className={`order-6 min-w-0 overflow-hidden lg:order-none ${
-              allYears ? 'lg:shrink-0' : 'lg:min-h-0 lg:flex-1'
-            }`}
-          >
-            <Suspense
-              fallback={
-                <MapFallback
+          {modules.footprint ? (
+            <div
+              className={`order-7 min-w-0 overflow-hidden lg:order-none ${
+                allYears ? 'lg:shrink-0' : 'lg:min-h-0 lg:flex-1'
+              }`}
+            >
+              <Suspense
+                fallback={
+                  <MapFallback
+                    className={
+                      allYears
+                        ? 'h-[220px] lg:h-[260px]'
+                        : 'h-[200px] lg:h-full lg:min-h-[180px]'
+                    }
+                  />
+                }
+              >
+                <ChinaMap
+                  activities={filtered}
+                  filter={filter}
+                  selectedProvince={selectedProvince}
+                  onSelectProvince={(p) => {
+                    setSelectedProvince(p);
+                    setSelectedActivity(null);
+                  }}
                   className={
-                    allYears
-                      ? 'h-[220px] lg:h-[260px]'
-                      : 'h-[200px] lg:h-full lg:min-h-[180px]'
+                    allYears ? 'h-[220px] lg:h-[260px]' : 'h-[200px] lg:h-full'
                   }
                 />
-              }
-            >
-              <ChinaMap
-                activities={filtered}
-                filter={filter}
-                selectedProvince={selectedProvince}
-                onSelectProvince={(p) => {
-                  setSelectedProvince(p);
-                  setSelectedActivity(null);
-                }}
-                className={
-                  allYears ? 'h-[220px] lg:h-[260px]' : 'h-[200px] lg:h-full'
-                }
-              />
-            </Suspense>
-          </div>
+              </Suspense>
+            </div>
+          ) : null}
           {allYears ? (
             <>
               {routeMap}
@@ -373,7 +488,7 @@ function DashboardProContent({
         </div>
 
         {allYears ? null : (
-          <div className="order-5 flex min-w-0 flex-col overflow-hidden lg:order-none lg:col-start-1 lg:row-start-2 lg:min-h-0">
+          <div className="order-6 flex min-w-0 flex-col overflow-hidden lg:order-none lg:col-start-1 lg:row-start-2 lg:min-h-0">
             {activityLog}
           </div>
         )}
@@ -390,6 +505,7 @@ function DashboardProContent({
         <RunAnalysisLauncher
           activity={selectedActivity}
           onOpenChange={setAnalysisOpen}
+          anonymousTitles={useAnonymousTitles}
         />
       </Suspense>
     </main>
@@ -401,6 +517,9 @@ function DashboardProInner() {
   const { locale } = useLocale();
   const [filter] = useState('all' as const);
   const [page, setPage] = useState<Page>('home');
+  const [fabClearance, setFabClearance] = useState<'none' | 'one' | 'two'>(
+    'none'
+  );
 
   // Drives the `:lang(zh)` rules in index.css (e.g. the `eyebrow` utility,
   // where uppercase/wide tracking only makes sense for Latin labels).
@@ -416,9 +535,13 @@ function DashboardProInner() {
   return (
     <div
       className={
-        page === 'summary'
-          ? 'flex h-svh flex-col bg-[var(--color-bg)]'
-          : 'min-h-screen bg-[var(--color-bg)]'
+        page === 'summary' || page === 'tracks'
+          ? // dvh (not svh): mobile toolbars make svh shorter than the visual
+            // viewport and left a ~100px paper-colored gap under the summary shell.
+            // Tracks: same lock so body/html never grows a document scrollbar;
+            // wall/page scrolls inside the content pane instead.
+            'flex h-dvh flex-col overflow-hidden bg-[var(--color-bg)]'
+          : 'min-h-dvh bg-[var(--color-bg)]'
       }
       data-filter={filter}
     >
@@ -433,7 +556,7 @@ function DashboardProInner() {
 
       <div
         className={
-          page === 'summary'
+          page === 'summary' || page === 'tracks'
             ? 'flex min-h-0 flex-1 flex-col overflow-hidden'
             : undefined
         }
@@ -444,12 +567,26 @@ function DashboardProInner() {
             dark={dark}
             filter={filter}
             onNavigateHome={() => navigate('home')}
+            onFabClearanceChange={setFabClearance}
           />
         </Suspense>
       </div>
 
-      {page !== 'summary' ? (
-        <footer className="flex items-center justify-center border-t border-[var(--color-border)] py-6 text-sm text-[var(--color-muted)]">
+      {page === 'home' ? (
+        <footer
+          className="flex items-center justify-center border-t border-[var(--color-border)] py-6 text-sm text-[var(--color-muted)]"
+          style={
+            fabClearance === 'none'
+              ? undefined
+              : {
+                  // Clearance sits under the copyright so the last card hugs the footer.
+                  paddingBottom:
+                    fabClearance === 'two'
+                      ? 'calc(5.75rem + env(safe-area-inset-bottom, 0px))'
+                      : 'calc(3.25rem + env(safe-area-inset-bottom, 0px))',
+                }
+          }
+        >
           <span>
             &copy; {FOOTER_YEAR} Running Page 3.0 ·{' '}
             {GITHUB_URL ? (
@@ -472,6 +609,9 @@ function DashboardProInner() {
 }
 
 export default function DashboardProTheme() {
+  // Lite payload fetch overlaps the theme chunk download; Suspense inside
+  // DashboardContentSkeleton handles first visit.
+  void preloadProActivityData();
   return (
     <PrivacyUnlockProvider>
       <DashboardProInner />

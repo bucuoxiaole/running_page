@@ -22,6 +22,7 @@ import {
   mapboxControlLocale,
   mapLabelLanguage,
   MAP_STYLE_LOAD_TIMEOUT_MS,
+  nextBasemapProvider,
   type BasemapProvider,
 } from '@/core/mapStyle';
 import { useLocale } from '@/hooks/useLocale';
@@ -64,7 +65,7 @@ import {
   downloadBlob,
   MapVideoAbortedError,
   MapVideoUnsupportedError,
-  phoneChaseZoomOutExtra,
+  prepareMapVideoViewport,
   startMapVideoCapture,
   type MapVideoCapture,
 } from '@/utils/exportMapVideo';
@@ -81,6 +82,8 @@ interface RouteMapProps {
   /** Hide basemap tiles; keep route lines (classic privacy lights-off) */
   lightsOff?: boolean;
   className?: string;
+  /** Fires when chase playback starts/stops (mobile dock play-height). */
+  onPlaybackChange?: (playing: boolean) => void;
 }
 
 function applyLightsOff(map: mapboxgl.Map, lightsOff: boolean) {
@@ -115,6 +118,7 @@ export function RouteMap({
   onClearSelection,
   lightsOff = false,
   className = '',
+  onPlaybackChange,
 }: RouteMapProps) {
   const { locale, t } = useLocale();
   const mapContainerRef = useRef<HTMLDivElement>(null);
@@ -132,6 +136,11 @@ export function RouteMap({
     displayActivity.run_id !== selectedActivity.run_id
       ? displayActivity
       : null;
+  const hasGeometry = Boolean(
+    selectedActivity
+      ? displayActivity?.summary_polyline
+      : activities.some((a) => a.summary_polyline)
+  );
   const activitiesRef = useRef(activities);
   const selectedRef = useRef(selectedActivity);
   const displayRef = useRef(displayActivity);
@@ -139,6 +148,10 @@ export function RouteMap({
   const orbitRef = useRef(createMapOrbitController());
   const selectedCoordsRef = useRef<Coordinate[] | null>(null);
   const [chaseRunId, setChaseRunId] = useState<string | null>(null);
+  /** Bumped after video export so a layout effect can rebuild the selected
+   *  trail AFTER chasing→false effects (settle resize) have committed. */
+  const trailRestoreGenRef = useRef(0);
+  const [trailRestoreGen, setTrailRestoreGen] = useState(0);
   const [playbackSnap, setPlaybackSnap] = useState<PlaybackProgress | null>(
     null
   );
@@ -150,6 +163,10 @@ export function RouteMap({
   const [exportEnding, setExportEnding] = useState(false);
   const [exportConverting, setExportConverting] = useState(false);
   const [exportMessage, setExportMessage] = useState<string | null>(null);
+  /** Basemap/script load: quiet empty when error; ready on style.load. */
+  const [mapStatus, setMapStatus] = useState<'loading' | 'ready' | 'error'>(
+    'loading'
+  );
   const fsRootRef = useRef<HTMLDivElement>(null);
   const [chromeRoot, setChromeRoot] = useState<HTMLDivElement | null>(null);
   const bindFsRoot = useCallback((el: HTMLDivElement | null) => {
@@ -160,6 +177,9 @@ export function RouteMap({
   const videoCaptureRef = useRef<MapVideoCapture | null>(null);
   const selectedId = selectedActivity ? String(selectedActivity.run_id) : null;
   const chasing = chaseRunId != null && chaseRunId === selectedId;
+  useEffect(() => {
+    onPlaybackChange?.(chasing);
+  }, [chasing, onPlaybackChange]);
   const playbackSeries = usePlaybackSeries(
     chasing,
     selectedActivity?.run_id ?? null
@@ -572,14 +592,16 @@ export function RouteMap({
     }
     const map = mapRef.current;
     if (!map || !chasing) return;
+    let restoreViewport: (() => void) | undefined;
     try {
-      // Phone 9:16 cover reads closer — pull 2D chase out for the clip only.
-      const canvas = map.getCanvas();
-      chaseRef.current.setZoomOutExtra(
-        opts.sizeMode === 'phone'
-          ? phoneChaseZoomOutExtra(canvas.clientWidth, canvas.clientHeight)
-          : 0
-      );
+      // Render the map at the export frame size (e.g. 1080×1920) so WebGL
+      // pixels match the file — no cover-upscale of a small on-screen buffer.
+      const prepared = await prepareMapVideoViewport(map, {
+        sizeMode: opts.sizeMode,
+      });
+      restoreViewport = prepared.restore;
+      // Compensate larger export CSS box so route fill matches prior cover framing.
+      chaseRef.current.setZoomOutExtra(prepared.chaseZoomOutExtra);
       // Always restart from the beginning for a clean export clip.
       chaseRef.current.seek(0);
       if (chaseRef.current.isPaused()) chaseRef.current.resume();
@@ -681,7 +703,11 @@ export function RouteMap({
         setExportMessage(t('exportVideoFailed'));
       }
     } finally {
-      const hadCapture = videoCaptureRef.current != null;
+      // Export grows CSS/DPR; restore + setChaseRunId(null) then settle-resize
+      // can leave selected invisible. Rebuild via updateRoutes (pre-chase path)
+      // after viewport idle AND again after React chasing→false effects.
+      const shouldRestoreTrail =
+        videoCaptureRef.current != null || restoreViewport != null;
       videoCaptureRef.current = null;
       setExporting(false);
       setExportEnding(false);
@@ -689,15 +715,45 @@ export function RouteMap({
       chaseRef.current.setZoomOutExtra(0);
       chaseRef.current.setStrokeScale(1);
       window.setTimeout(() => setExportMessage(null), 4000);
-      if (hadCapture) {
+
+      if (!shouldRestoreTrail) {
+        restoreViewport?.();
+      } else {
+        const live = mapRef.current;
+        if (live?.getLayer('selected')) {
+          live.setPaintProperty('selected', 'line-opacity', 0.9);
+        }
         chaseRef.current.stop({ silent: true });
         setChaseRunId(null);
         setPlaybackSnap(null);
-        const live = mapRef.current;
-        if (live) {
-          restoreSelectedLine(live);
-          if (!view3dRef.current) clearMapTerrain(live);
-        }
+        if (live && !view3dRef.current) clearMapTerrain(live);
+
+        const restore = restoreViewport;
+        const gen = ++trailRestoreGenRef.current;
+        void (async () => {
+          restore?.();
+          const m = mapRef.current;
+          if (!m) return;
+          try {
+            await waitForMapIdle(m, 1500);
+          } catch {
+            /* ignore */
+          }
+          await new Promise<void>((r) =>
+            requestAnimationFrame(() => requestAnimationFrame(() => r()))
+          );
+          if (trailRestoreGenRef.current !== gen || mapRef.current !== m)
+            return;
+          // Same path as selecting an activity (pre-chase): full layer rebuild.
+          orbitRef.current.stop();
+          updateRoutesRef.current();
+          setTrailRestoreGen(gen);
+          window.setTimeout(() => {
+            if (trailRestoreGenRef.current !== gen) return;
+            orbitRef.current.stop();
+            updateRoutesRef.current();
+          }, PLAYBACK_LAYOUT_EXIT_RESIZE_MS + 80);
+        })();
       }
     }
   };
@@ -708,6 +764,16 @@ export function RouteMap({
       videoCaptureRef.current = null;
     };
   }, []);
+
+  // After export: chasing has flipped false and settle effect may have resized.
+  // Rebuild selected trail on the post-commit tree (updateRoutes = pre-chase path).
+  useLayoutEffect(() => {
+    if (trailRestoreGen === 0 || chasing) return;
+    const map = mapRef.current;
+    if (!map?.isStyleLoaded()) return;
+    orbitRef.current.stop();
+    updateRoutesRef.current();
+  }, [trailRestoreGen, chasing]);
 
   // Keep play-sized surface for expand AND collapse; outer clips. Drop size then
   // resize on exit so Mapbox/ResizeObserver do not blank mid-animation.
@@ -806,6 +872,7 @@ export function RouteMap({
     if (MAPBOX_TOKEN) mapboxgl.accessToken = MAPBOX_TOKEN;
 
     styleIdleRef.current = false;
+    setMapStatus('loading');
 
     const hasRouteLayers = (map: mapboxgl.Map) => {
       try {
@@ -820,24 +887,51 @@ export function RouteMap({
       if (!map?.isStyleLoaded()) return;
       styleIdleRef.current = true;
       if (chaseRef.current.isAnimating()) return;
+      // routes-only is not enough: export/DPR resize can drop `selected`
+      // while overview `routes` survives — previous check skipped rebuild.
+      if (selectedRef.current && !map.getLayer('selected')) {
+        updateRoutesRef.current();
+        return;
+      }
       if (hasRouteLayers(map)) return;
       updateRoutesRef.current();
     };
 
-    mapRef.current = new mapboxgl.Map({
-      container,
-      style,
-      center: [121.4, 31.2],
-      zoom: 10,
-      pitch: 0,
-      maxPitch: 85,
-      attributionControl: false,
-      /** Needed so WebGL frames remain readable for MediaRecorder export. */
-      preserveDrawingBuffer: true,
-      keyboard: false,
-      language: mapLabelLanguage(locale),
-      locale: mapboxControlLocale(t),
-    });
+    let settled = false;
+    let timedOut = false;
+
+    const fallBackBasemap = (reason: string) => {
+      if (settled || lightsOff) return;
+      const next = nextBasemapProvider(provider);
+      if (!next) {
+        setMapStatus('error');
+        return;
+      }
+      settled = true;
+      console.warn(reason);
+      setProvider(next);
+    };
+
+    try {
+      mapRef.current = new mapboxgl.Map({
+        container,
+        style,
+        center: [121.4, 31.2],
+        zoom: 10,
+        pitch: 0,
+        maxPitch: 85,
+        attributionControl: false,
+        /** Needed so WebGL frames remain readable for MediaRecorder export. */
+        preserveDrawingBuffer: true,
+        keyboard: false,
+        language: mapLabelLanguage(locale),
+        locale: mapboxControlLocale(t),
+      });
+    } catch (err) {
+      console.warn('Map failed to initialize', err);
+      setMapStatus('error');
+      return;
+    }
 
     if (!useBlank) {
       mapRef.current.addControl(
@@ -846,41 +940,39 @@ export function RouteMap({
       );
     }
 
-    let settled = false;
-    let timedOut = false;
-
-    const fallBackFromMapbox = (reason: string) => {
-      if (settled || provider !== 'mapbox' || lightsOff) return;
-      settled = true;
-      console.warn(reason);
-      setProvider('carto');
-    };
-
     const timer = window.setTimeout(() => {
       if (!mapRef.current || mapRef.current.isStyleLoaded() || timedOut) return;
       timedOut = true;
-      if (provider === 'mapbox' && !lightsOff) {
-        fallBackFromMapbox(
-          'Map style load timed out; falling back to CARTO basemap'
-        );
-      } else if (!lightsOff) {
-        console.warn(
-          'CARTO style load timed out; falling back to blank basemap'
-        );
-        mapRef.current.setStyle(blankMapStyle(bg));
+      if (!lightsOff) {
+        const next = nextBasemapProvider(provider);
+        if (next) {
+          fallBackBasemap(
+            `Map style load timed out (${provider}); falling back to ${next}`
+          );
+        } else {
+          console.warn(
+            'Map style load timed out; no further free basemap fallback'
+          );
+          setMapStatus('error');
+        }
       }
     }, MAP_STYLE_LOAD_TIMEOUT_MS);
 
     const onError = (event: mapboxgl.ErrorEvent) => {
       if (isMapboxAuthError(event.error)) {
-        fallBackFromMapbox('Mapbox auth failed; falling back to CARTO basemap');
+        fallBackBasemap('Mapbox auth failed; falling back to next basemap');
       }
     };
 
     mapRef.current.on('error', onError);
-    const onUserCameraChange = (event: { originalEvent?: Event }) => {
+    // Mapbox declares these payloads as `{ originalEvent? } | void`; `EventOf`
+    // then collapses to `{ type, target }`, so `originalEvent` is absent from
+    // the inferred type. Take `unknown` and read the field defensively.
+    const onUserCameraChange = (payload?: unknown) => {
       // Programmatic fitBounds/easeTo have no originalEvent; ignore those.
-      if (!event.originalEvent) return;
+      const originalEvent = (payload as { originalEvent?: Event } | undefined)
+        ?.originalEvent;
+      if (!originalEvent) return;
       if (chaseRef.current.isAnimating() || orbitRef.current.isAnimating())
         return;
       const map = mapRef.current;
@@ -900,6 +992,7 @@ export function RouteMap({
         settled = true;
         window.clearTimeout(timer);
       }
+      setMapStatus('ready');
       ensureRoutes();
     });
     mapRef.current.on('idle', ensureRoutes);
@@ -907,7 +1000,10 @@ export function RouteMap({
     mapRef.current.on('zoomend', onUserCameraChange);
     mapRef.current.on('rotateend', onUserCameraChange);
     mapRef.current.on('pitchend', onUserCameraChange);
-    if (mapRef.current.isStyleLoaded()) ensureRoutes();
+    if (mapRef.current.isStyleLoaded()) {
+      setMapStatus('ready');
+      ensureRoutes();
+    }
 
     mapRef.current.addControl(new mapboxgl.NavigationControl(), 'top-right');
 
@@ -1041,6 +1137,15 @@ export function RouteMap({
         >
           {t('routeFallbackNone')}
         </p>
+      ) : null}
+      {mapStatus === 'error' ? (
+        <div className="route-map-empty z-10" role="status">
+          {t('mapBasemapFailed')}
+        </div>
+      ) : mapStatus === 'ready' && !selectedActivity && !hasGeometry ? (
+        <div className="route-map-empty z-10" role="status">
+          {t('mapNoGeometry')}
+        </div>
       ) : null}
       <div
         className={

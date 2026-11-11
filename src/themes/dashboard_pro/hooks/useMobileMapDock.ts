@@ -20,6 +20,35 @@ const AT_HOME_PX = 12;
 /** Keep slot spacer after unfixed so in-flow height owns layout. */
 const HANDOFF_MS = 100;
 
+/**
+ * When the collapsed map FAB may appear.
+ * - Still below the fold → hide (homepage must not flash「显示轨迹」).
+ * - Fully above the header → show (scrolled past — user can tap to bring map back).
+ * - Midpoint at/above the header while bottom still peeks → show
+ *   (lower half in the visible area).
+ */
+function mapDockFabVisible(rect: DOMRectReadOnly): boolean {
+  const viewTop = HEADER_INSET_PX;
+  const viewBottom = typeof window !== 'undefined' ? window.innerHeight : 0;
+  if (rect.width < 1 || rect.height < 1 || viewBottom < 1) return false;
+  if (rect.top >= viewBottom) return false;
+  if (rect.bottom <= viewTop) return true;
+  const mid = rect.top + rect.height * 0.5;
+  return mid <= viewTop;
+}
+
+/**
+ * Match `.route-map-play-surface.is-play-sized` /
+ * `.card.route-map--playing` mobile play heights.
+ */
+export function playbackMapHeightPx(): number {
+  const vh = window.innerHeight;
+  if (window.matchMedia('(min-width: 768px)').matches) {
+    return Math.round(Math.min(vh * 0.65, 560));
+  }
+  return Math.round(Math.min(vh * 0.7, 520));
+}
+
 export type MapDockFrame = {
   left: number;
   width: number;
@@ -33,7 +62,8 @@ type PinBox = { top: number; left: number; width: number; height: number };
 /**
  * Mobile map dock — Option A (two states, no sticky while expanded).
  *
- * Collapsed: map is normal in-flow. FAB only when the slot is fully away.
+ * Collapsed: map is normal in-flow. FAB when scrolled past / lower half
+ * peeks under the header — not while the slot is still below the fold.
  * Expanded: slide-down into `fixed top-20`; stays fixed until FAB
  * collapse (no sticky reseat). Collapse slides out (to slot if on-screen,
  * otherwise up), then releaseToFlow. Spacer keeps document height.
@@ -50,10 +80,17 @@ export function useMobileMapDock(
   slotRef: RefObject<HTMLDivElement | null>,
   pinRef: RefObject<HTMLDivElement | null>,
   /** Remount signal (e.g. home allYears vs single year) so observers rebind. */
-  layoutKey: string | number | boolean = 0
+  layoutKey: string | number | boolean = 0,
+  /**
+   * When non-null (chase play surface tall), grow the fixed pin and slot
+   * spacer to this height so Mapbox compass stays inside the visible card.
+   */
+  playHeightPx: number | null = null
 ) {
   const [isMobile, setIsMobile] = useState(false);
   const [outOfView, setOutOfView] = useState(false);
+  /** FAB affordance — stricter than outOfView (ignores below-fold). */
+  const [fabVisible, setFabVisible] = useState(false);
   const [expanded, setExpanded] = useState(false);
   /** Keep slot height after unfixed until in-flow map owns the height. */
   const [holdSpacer, setHoldSpacer] = useState(false);
@@ -68,6 +105,18 @@ export function useMobileMapDock(
   const handoffRafRef = useRef<number | null>(null);
   /** True while fixed overlay still covers the slot during collapse handoff. */
   const fixedDuringHandoffRef = useRef(false);
+  const holdSpacerRef = useRef(false);
+  const playHeightPxRef = useRef<number | null>(playHeightPx);
+  /** Idle map height before chase grow — never read from a play-sized spacer. */
+  const baseHeightRef = useRef(280);
+
+  useEffect(() => {
+    playHeightPxRef.current = playHeightPx;
+  }, [playHeightPx]);
+
+  useEffect(() => {
+    holdSpacerRef.current = holdSpacer;
+  }, [holdSpacer]);
 
   useEffect(() => {
     pinMotionRef.current = pinMotion;
@@ -108,12 +157,24 @@ export function useMobileMapDock(
     if (!slot) return null;
     const rect = slot.getBoundingClientRect();
     if (rect.width <= 1) return null;
-    if (rect.height > 1) lastHeightRef.current = rect.height;
+    // Slot is a locked spacer while away / expanded / handoff / chasing.
+    // Sampling it after stop (playHeight already null, frame still tall) was
+    // baking ~70vh into lastHeight — 「显示轨迹」→ play → stop stuck tall.
+    const spacerLocked =
+      expandedRef.current ||
+      outOfViewRef.current ||
+      holdSpacerRef.current ||
+      playHeightPxRef.current != null;
+    if (rect.height > 1 && !spacerLocked) {
+      const h = Math.round(rect.height);
+      lastHeightRef.current = h;
+      baseHeightRef.current = h;
+    }
     return {
       top: Math.round(rect.top),
       left: Math.round(rect.left),
       width: Math.round(rect.width),
-      height: Math.round(lastHeightRef.current),
+      height: Math.round(baseHeightRef.current || lastHeightRef.current),
     };
   }, [slotRef]);
 
@@ -122,6 +183,17 @@ export function useMobileMapDock(
     if (!slot) return null;
     return { ...slot, top: PIN_TOP_PX };
   }, [readSlotBox]);
+
+  /** Dock box for the fixed pin — optionally taller while chasing. */
+  const resolveDockBox = useCallback((): PinBox | null => {
+    const box = readDockBox();
+    if (!box) return null;
+    // Non-null playHeightPx enables grow; recompute px so resize stays fresh.
+    if (playHeightPxRef.current != null && playHeightPxRef.current > 0) {
+      return { ...box, height: playbackMapHeightPx() };
+    }
+    return box;
+  }, [readDockBox]);
 
   const writePin = useCallback(
     (box: PinBox, transitionMs = 0) => {
@@ -242,9 +314,14 @@ export function useMobileMapDock(
     const el = pinRef.current;
     const home = readSlotBox();
     if (el && home) {
-      const childH = el.firstElementChild?.getBoundingClientRect().height ?? 0;
-      const height = childH > 1 ? Math.round(childH) : Math.round(home.height);
-      if (height > 1) lastHeightRef.current = height;
+      // Handoff after 「显示轨迹」+ chase: always reseat to frozen base height,
+      // never the still-tall play surface / spacer.
+      const base = Math.round(
+        baseHeightRef.current || lastHeightRef.current || home.height || 320
+      );
+      const height = base;
+      lastHeightRef.current = height;
+      baseHeightRef.current = height;
       const onScreen =
         home.top < window.innerHeight && home.top + home.height > 0;
       if (onScreen) {
@@ -296,14 +373,15 @@ export function useMobileMapDock(
   ]);
 
   /**
-   * Slot fully away vs in view — drives FAB when collapsed and spacer while
-   * expanded. Uses the plain layout placeholder (no sticky on this node).
-   * Root top inset = sticky header so a slot only peeking under the title
-   * counts as away (show「显示轨迹」). Never clears pinMotion === 'in'.
+   * Slot fully away vs in view — drives spacer while expanded / away.
+   * FAB uses mapDockFabVisible (scrolled past / mid under header;
+   * hide below-fold). Root top inset = sticky
+   * header. Never clears pinMotion === 'in'.
    */
   useEffect(() => {
     if (!active) {
       setOutOfView(false);
+      setFabVisible(false);
       setExpanded(false);
       setHoldSpacer(false);
       setPinMotion(null);
@@ -316,14 +394,19 @@ export function useMobileMapDock(
 
     const observer = new IntersectionObserver(
       ([entry]) => {
+        const rect = slot.getBoundingClientRect();
+        setFabVisible(mapDockFabVisible(rect));
         if (!entry.isIntersecting) {
-          const rect = slot.getBoundingClientRect();
           if (rect.width > 1) {
-            if (rect.height > 1) lastHeightRef.current = rect.height;
+            // Away slot is a spacer — never learn base height from it.
+            const height =
+              playHeightPxRef.current != null && playHeightPxRef.current > 0
+                ? playbackMapHeightPx()
+                : Math.round(baseHeightRef.current || lastHeightRef.current);
             setFrame({
               left: Math.round(rect.left),
               width: Math.round(rect.width),
-              height: Math.round(lastHeightRef.current),
+              height,
             });
           }
           setOutOfView(true);
@@ -333,26 +416,63 @@ export function useMobileMapDock(
       },
       {
         rootMargin: `-${HEADER_INSET_PX}px 0px 0px 0px`,
-        threshold: 0,
+        // Extra steps so mid-crossing (lower-half peek) fires reliably.
+        threshold: [0, 0.25, 0.5, 0.75, 1],
       }
     );
     observer.observe(slot);
 
     const seed = slot.getBoundingClientRect();
     if (seed.width > 1 && seed.height > 1) {
-      lastHeightRef.current = seed.height;
+      const playing =
+        playHeightPxRef.current != null && playHeightPxRef.current > 0;
+      const spacerLocked =
+        expandedRef.current || outOfViewRef.current || holdSpacerRef.current;
+      if (!playing && !spacerLocked) {
+        const h = Math.round(seed.height);
+        lastHeightRef.current = h;
+        baseHeightRef.current = h;
+      }
       setFrame({
         left: Math.round(seed.left),
         width: Math.round(seed.width),
-        height: Math.round(seed.height),
+        height: playing
+          ? playbackMapHeightPx()
+          : Math.round(baseHeightRef.current || lastHeightRef.current),
       });
     }
     const away =
       seed.bottom <= HEADER_INSET_PX || seed.top >= window.innerHeight;
     setOutOfView(away);
+    setFabVisible(mapDockFabVisible(seed));
 
     return () => observer.disconnect();
   }, [active, layoutKey, slotRef, clearPinInline]);
+
+  // Keep FAB visibility in sync on scroll/resize — IO thresholds alone can
+  // miss lower-half enter/leave while the slot stays "intersecting".
+  useEffect(() => {
+    if (!active) return;
+    let raf = 0;
+    const syncFab = () => {
+      raf = 0;
+      const slot = slotRef.current;
+      if (!slot) return;
+      setFabVisible(mapDockFabVisible(slot.getBoundingClientRect()));
+    };
+    const onScrollOrResize = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(syncFab);
+    };
+    syncFab();
+    window.addEventListener('scroll', onScrollOrResize, { passive: true });
+    window.addEventListener('resize', onScrollOrResize);
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+      window.removeEventListener('scroll', onScrollOrResize);
+      window.removeEventListener('resize', onScrollOrResize);
+    };
+  }, [active, layoutKey, slotRef]);
 
   // Expanded: keep fixed dock box in sync (always pinned — Option A).
   useEffect(() => {
@@ -361,7 +481,7 @@ export function useMobileMapDock(
     const sync = () => {
       raf = 0;
       if (pinMotionRef.current != null) return;
-      const box = readDockBox();
+      const box = resolveDockBox();
       if (!box) return;
       const el = pinRef.current;
       // Remount can leave geometry without position:fixed — re-assert full box.
@@ -390,13 +510,21 @@ export function useMobileMapDock(
       window.removeEventListener('scroll', onScrollOrResize);
       window.removeEventListener('resize', onScrollOrResize);
     };
-  }, [active, expanded, layoutKey, readDockBox, writePin, pinRef]);
+  }, [
+    active,
+    expanded,
+    layoutKey,
+    playHeightPx,
+    resolveDockBox,
+    writePin,
+    pinRef,
+  ]);
 
   // Enter / exit motion via `top` (no transform on map ancestors).
   useLayoutEffect(() => {
     if (!active || !expanded || pinMotion == null) return;
     const home = readSlotBox();
-    const dock = readDockBox();
+    const dock = resolveDockBox();
     if (!home || !dock) {
       if (pinMotion === 'out') {
         releaseToFlow();
@@ -462,7 +590,7 @@ export function useMobileMapDock(
     expanded,
     pinMotion,
     readSlotBox,
-    readDockBox,
+    resolveDockBox,
     writePin,
     releaseToFlow,
     pinRef,
@@ -474,8 +602,18 @@ export function useMobileMapDock(
     if (!slot) return;
     const ro = new ResizeObserver(() => {
       const rect = slot.getBoundingClientRect();
-      if (rect.height > 1) lastHeightRef.current = rect.height;
-      if (expandedRef.current || outOfViewRef.current || holdSpacer) return;
+      if (
+        expandedRef.current ||
+        outOfViewRef.current ||
+        holdSpacerRef.current
+      ) {
+        return;
+      }
+      if (rect.height > 1 && playHeightPxRef.current == null) {
+        const h = Math.round(rect.height);
+        lastHeightRef.current = h;
+        baseHeightRef.current = h;
+      }
       if (rect.width > 1 && rect.height > 1) {
         setFrame({
           left: Math.round(rect.left),
@@ -488,13 +626,99 @@ export function useMobileMapDock(
     return () => ro.disconnect();
   }, [active, layoutKey, holdSpacer, slotRef]);
 
+  // Grow / shrink spacer + pin when chase play height toggles.
+  // Always restore to baseHeightRef (captured before chase), including the
+  // 「显示轨迹」expanded path — stop must shrink the fixed pin, not keep 70vh.
+  useLayoutEffect(() => {
+    if (!active) return;
+    if (playHeightPx != null && playHeightPx > 0) {
+      // Freeze idle height once at chase start (slot may already be a spacer).
+      if (baseHeightRef.current < 1) {
+        baseHeightRef.current = lastHeightRef.current || 320;
+      }
+    } else {
+      // Play ended (or never started): keep lastHeight aligned to frozen base.
+      const base = Math.round(
+        baseHeightRef.current || lastHeightRef.current || 320
+      );
+      lastHeightRef.current = base;
+    }
+
+    const base = Math.round(
+      baseHeightRef.current || lastHeightRef.current || 320
+    );
+
+    if (!expanded) {
+      if (playHeightPx != null) {
+        // Away + chasing: spacer tracks play height so document scroll stays sane.
+        setFrame((prev) => {
+          if (!prev) return prev;
+          const h = playbackMapHeightPx();
+          if (prev.height === h) return prev;
+          return { ...prev, height: h };
+        });
+        return;
+      }
+      setFrame((prev) => {
+        if (!prev || prev.height === base) return prev;
+        return { ...prev, height: base };
+      });
+      return;
+    }
+
+    const box = resolveDockBox();
+    if (!box) return;
+    // resolveDockBox uses base via readSlotBox; force height explicitly on stop.
+    const next = {
+      ...box,
+      height: playHeightPx != null ? playbackMapHeightPx() : base,
+    };
+    setFrame((prev) => {
+      if (!prev) {
+        return { left: next.left, width: next.width, height: next.height };
+      }
+      if (
+        prev.height === next.height &&
+        prev.left === next.left &&
+        prev.width === next.width
+      ) {
+        return prev;
+      }
+      return {
+        ...prev,
+        left: next.left,
+        width: next.width,
+        height: next.height,
+      };
+    });
+    if (pinMotionRef.current == null) {
+      writePin(next, 0);
+    }
+  }, [active, expanded, playHeightPx, resolveDockBox, writePin]);
+
   const expand = useCallback(() => {
+    // Capture idle height only while the map is still in normal document flow.
+    // Off-screen 「显示轨迹」uses a locked spacer — trust baseHeightRef instead.
+    const slot = slotRef.current;
+    if (
+      slot &&
+      playHeightPxRef.current == null &&
+      !outOfViewRef.current &&
+      !holdSpacerRef.current
+    ) {
+      const rect = slot.getBoundingClientRect();
+      if (rect.height > 1) {
+        const h = Math.round(rect.height);
+        lastHeightRef.current = h;
+        baseHeightRef.current = h;
+      }
+    }
     snapshotFrame();
     setHoldSpacer(false);
     fixedDuringHandoffRef.current = false;
     setExpanded(true);
     setPinMotion('in');
-  }, [snapshotFrame]);
+  }, [snapshotFrame, slotRef]);
 
   const collapse = useCallback(() => {
     if (!expanded) return;
@@ -542,7 +766,7 @@ export function useMobileMapDock(
     return () => observer.disconnect();
   }, [active, expanded, releaseToFlow, slotRef]);
 
-  const showFab = active && (expanded || outOfView || holdSpacer);
+  const showFab = active && (expanded || fabVisible || holdSpacer);
   // Reserve slot height while away, expanded (map is fixed), or handing off.
   const lockHeight =
     active && frame != null && (outOfView || expanded || holdSpacer);
