@@ -12,6 +12,49 @@ export const AT_HOME_PX = 12;
  * takes the animated collapse instead of snapping.
  */
 export const AUTO_SNAP_PX = 32;
+/** Shared enter/exit duration for the fixed pin `top` slide. */
+export const PIN_MOTION_MS = 470;
+/** Same decelerating curve both ways — no overshoot on `top`. */
+export const PIN_MOTION_EASING = 'ease-out';
+/** Extra wait if `transitionend` never fires (e.g. top already equal). */
+export const PIN_TRANSITION_FALLBACK_EXTRA_MS = 80;
+/**
+ * Extra px past the viewport edge so a fully-hidden pin does not leave a
+ * hairline at y=0. The old start/end `PIN_TOP_PX - height` left an 80px
+ * strip sitting under the header at the end of an off-screen collapse.
+ */
+export const OFFSCREEN_PIN_SLACK_PX = 8;
+
+/** `top` that places the pin fully above the viewport. */
+export function offscreenPinTop(
+  height: number,
+  slackPx: number = OFFSCREEN_PIN_SLACK_PX
+): number {
+  if (!Number.isFinite(height) || height <= 0) return -slackPx;
+  return -height - slackPx;
+}
+
+export function pinTransitionFallbackMs(
+  durationMs: number,
+  extraMs: number = PIN_TRANSITION_FALLBACK_EXTRA_MS
+): number {
+  return durationMs + extraMs;
+}
+
+/**
+ * Kept pin height vs the in-flow height we are about to hand back to.
+ * Close enough means the spacer can drop without a delayed second layout.
+ */
+export function handoffHeightClose(
+  keptHeight: number,
+  naturalHeight: number,
+  slackPx: number = 1
+): boolean {
+  if (!Number.isFinite(keptHeight) || !Number.isFinite(naturalHeight)) {
+    return false;
+  }
+  return Math.abs(keptHeight - naturalHeight) <= slackPx;
+}
 
 type Rect = {
   top: number;

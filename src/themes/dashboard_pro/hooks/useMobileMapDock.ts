@@ -7,8 +7,13 @@ import {
   type RefObject,
 } from 'react';
 import {
+  handoffHeightClose,
   mapDockFabVisible,
+  offscreenPinTop,
+  PIN_MOTION_EASING,
+  PIN_MOTION_MS,
   pinAlreadyHome,
+  pinTransitionFallbackMs,
   slotFullyVisible,
 } from './mapDockGeometry';
 
@@ -18,11 +23,9 @@ const PIN_TOP_PX = 80;
 /** Sticky page header height — shrink IO viewport from the top so a
  *  slot only visible under the header counts as fully away (FAB). */
 const HEADER_INSET_PX = 64;
-const PIN_IN_MS = 470;
-const PIN_OUT_MS = 420;
 /** Pin already over the slot — skip exit motion. */
 const AT_HOME_PX = 12;
-/** Keep slot spacer after unfixed so in-flow height owns layout. */
+/** Fallback only when in-flow height still disagrees after unfixed. */
 const HANDOFF_MS = 100;
 
 /**
@@ -55,10 +58,15 @@ type PinBox = { top: number; left: number; width: number; height: number };
  * Expanded: slide-down into `fixed top-20`; stays fixed until FAB
  * collapse (no sticky reseat). Collapse slides out (to slot if on-screen,
  * otherwise up), then releaseToFlow. Spacer keeps document height.
+ * Enter and exit share PIN_MOTION_MS and ease-out; motion end listens for
+ * transitionend with a timeout fallback.
  *
  * Collapse handoff (anti-flash): stay `position:fixed` over the slot until
  * React has switched off `h-full` to the in-flow height class, then drop
  * fixed with matching pixel geometry. Never tween height mid-handoff.
+ * If the kept height already matches in-flow, drop the spacer immediately
+ * instead of a delayed second layout; keep the delay when heights disagree
+ * so the document does not jump.
  *
  * Never put CSS `transform` on `pinRef` / map ancestors (Mapbox projection).
  * Never clear `pinMotion === 'in'` from the away/IO path.
@@ -91,6 +99,7 @@ export function useMobileMapDock(
   const lastWrittenTopRef = useRef<number | null>(null);
   const releaseTimerRef = useRef<number | null>(null);
   const handoffRafRef = useRef<number | null>(null);
+  const pinTransitionCleanupRef = useRef<(() => void) | null>(null);
   /** True while fixed overlay still covers the slot during collapse handoff. */
   const fixedDuringHandoffRef = useRef(false);
   const holdSpacerRef = useRef(false);
@@ -133,6 +142,10 @@ export function useMobileMapDock(
       }
       if (handoffRafRef.current != null) {
         cancelAnimationFrame(handoffRafRef.current);
+      }
+      if (pinTransitionCleanupRef.current != null) {
+        pinTransitionCleanupRef.current();
+        pinTransitionCleanupRef.current = null;
       }
     },
     []
@@ -194,9 +207,7 @@ export function useMobileMapDock(
       el.style.width = `${box.width}px`;
       el.style.height = `${box.height}px`;
       if (transitionMs > 0) {
-        el.style.transition = `top ${transitionMs}ms ${
-          transitionMs === PIN_OUT_MS ? 'ease-in' : 'ease-out'
-        }`;
+        el.style.transition = `top ${transitionMs}ms ${PIN_MOTION_EASING}`;
       } else {
         el.style.transition = 'none';
       }
@@ -241,6 +252,46 @@ export function useMobileMapDock(
     return box;
   }, [readSlotBox]);
 
+  const cancelPinTransitionWait = useCallback(() => {
+    if (pinTransitionCleanupRef.current == null) return;
+    pinTransitionCleanupRef.current();
+    pinTransitionCleanupRef.current = null;
+  }, []);
+
+  /** Resolve when `top` finishes, or after a bounded fallback. Cancel skips onDone. */
+  const waitForPinTransition = useCallback(
+    (el: HTMLElement, durationMs: number, onDone: () => void) => {
+      cancelPinTransitionWait();
+      let settled = false;
+      let fallback = 0;
+      const onEnd = (event: TransitionEvent) => {
+        if (event.target !== el) return;
+        if (event.propertyName !== 'top') return;
+        finish();
+      };
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        el.removeEventListener('transitionend', onEnd);
+        window.clearTimeout(fallback);
+        if (pinTransitionCleanupRef.current === cleanup) {
+          pinTransitionCleanupRef.current = null;
+        }
+        onDone();
+      };
+      const cleanup = () => {
+        if (settled) return;
+        settled = true;
+        el.removeEventListener('transitionend', onEnd);
+        window.clearTimeout(fallback);
+      };
+      fallback = window.setTimeout(finish, pinTransitionFallbackMs(durationMs));
+      el.addEventListener('transitionend', onEnd);
+      pinTransitionCleanupRef.current = cleanup;
+    },
+    [cancelPinTransitionWait]
+  );
+
   /**
    * Begin collapse handoff: snap fixed pin onto the on-screen slot and flip
    * React to in-flow height classes, but KEEP position:fixed until the
@@ -248,6 +299,7 @@ export function useMobileMapDock(
    * (or flipping h-full→0) blanks Mapbox for a frame — Tracks「收起」flash.
    */
   const releaseToFlow = useCallback(() => {
+    cancelPinTransitionWait();
     if (releaseTimerRef.current != null) {
       window.clearTimeout(releaseTimerRef.current);
       releaseTimerRef.current = null;
@@ -276,7 +328,7 @@ export function useMobileMapDock(
     setPinMotion(null);
     // Stay fixed — clearPinInline runs in the handoff layout effect.
     setExpanded(false);
-  }, [pinRef, readSlotBox, writePin]);
+  }, [cancelPinTransitionWait, pinRef, readSlotBox, writePin]);
 
   /**
    * After expanded flips false, React paints in-flow height (not h-full)
@@ -322,18 +374,60 @@ export function useMobileMapDock(
 
     let raf2 = 0;
     let raf3 = 0;
+    const settleMap = () => {
+      // Mapbox often needs one resize after leaving a fixed layer even
+      // when CSS size is unchanged — otherwise the canvas stays blank.
+      window.dispatchEvent(new CustomEvent('mobile-map-dock-settled'));
+    };
     const raf1 = window.requestAnimationFrame(() => {
       raf2 = window.requestAnimationFrame(() => {
+        // Resize while still fixed so Mapbox matches the final box before
+        // we leave the layer — a post-unfixed resize reads as a tail hitch.
+        settleMap();
+        const pin = pinRef.current;
+        const keptHeight = pin
+          ? pin.getBoundingClientRect().height
+          : lastHeightRef.current;
+        // Card already has in-flow height classes (not h-full) while we
+        // are still fixed; that is the height we will wrap to, not only
+        // baseHeightRef (which equals the written pin height and made the
+        // previous fast path succeed even when CSS wanted a different size).
+        const card = pin?.firstElementChild;
+        const cardHeight =
+          card instanceof HTMLElement
+            ? card.getBoundingClientRect().height
+            : keptHeight;
+        const chasing =
+          playHeightPxRef.current != null && playHeightPxRef.current > 0;
+        const naturalHeight = chasing
+          ? playbackMapHeightPx()
+          : Math.round(
+              cardHeight ||
+                baseHeightRef.current ||
+                lastHeightRef.current ||
+                keptHeight
+            );
+        const canReleaseNow =
+          !chasing && handoffHeightClose(keptHeight, naturalHeight);
         clearPinInline(true);
+        if (pin && canReleaseNow) {
+          pin.style.height = '';
+        }
+        // Keep holdSpacer (transition-none, no play-spring) for one more
+        // frame so unfixed + height clear paint at rest first. Dropping
+        // the spacer in the same turn re-attached the overshoot spring
+        // on the same frame as the layout change.
         raf3 = window.requestAnimationFrame(() => {
-          const pin = pinRef.current;
-          if (pin) pin.style.height = '';
+          if (canReleaseNow) {
+            setHoldSpacer(false);
+            return;
+          }
+          const late = pinRef.current;
+          if (late) late.style.height = '';
           releaseTimerRef.current = window.setTimeout(() => {
             releaseTimerRef.current = null;
             setHoldSpacer(false);
-            // Mapbox often needs one resize after leaving a fixed layer even
-            // when CSS size is unchanged — otherwise the canvas stays blank.
-            window.dispatchEvent(new CustomEvent('mobile-map-dock-settled'));
+            settleMap();
           }, HANDOFF_MS);
         });
       });
@@ -531,15 +625,20 @@ export function useMobileMapDock(
       // Prefer slide-down from above the dock.
       const fromAbove: PinBox = {
         ...dock,
-        top: Math.min(home.top, PIN_TOP_PX - dock.height),
+        top: Math.min(home.top, offscreenPinTop(dock.height)),
       };
       writePin(fromAbove, 0);
       void el.offsetHeight;
-      writePin(dock, PIN_IN_MS);
-      const t = window.setTimeout(() => {
+      if (fromAbove.top === dock.top) {
+        writePin(dock, 0);
+        setPinMotion(null);
+        return;
+      }
+      writePin(dock, PIN_MOTION_MS);
+      waitForPinTransition(el, PIN_MOTION_MS, () => {
         if (pinMotionRef.current === 'in') setPinMotion(null);
-      }, PIN_IN_MS + 20);
-      return () => window.clearTimeout(t);
+      });
+      return () => cancelPinTransitionWait();
     }
 
     // out — stay fixed through the slide, then releaseToFlow (spacer on).
@@ -557,26 +656,27 @@ export function useMobileMapDock(
     writePin(dock, 0);
     void el.offsetHeight;
 
-    if (slotOnScreen) {
-      // Ease back toward the on-screen slot, then hand off to flow.
-      writePin(home, PIN_OUT_MS);
-    } else {
-      // Off-screen: mirror enter — slide up out of view; spacer keeps the hole.
+    const target: PinBox = slotOnScreen
+      ? home
+      : { ...dock, top: offscreenPinTop(dock.height) };
+    if (!slotOnScreen) {
+      // Off-screen: slide fully above the viewport (not to top-20 - height,
+      // which left an 80px strip visible, then a second pop on handoff).
       setHoldSpacer(true);
-      const above: PinBox = {
-        ...dock,
-        top: PIN_TOP_PX - dock.height,
-      };
-      writePin(above, PIN_OUT_MS);
     }
-
-    const t = window.setTimeout(() => {
+    if (target.top === dock.top) {
+      releaseToFlow();
+      return;
+    }
+    writePin(target, PIN_MOTION_MS);
+    waitForPinTransition(el, PIN_MOTION_MS, () => {
       if (pinMotionRef.current !== 'out') return;
       releaseToFlow();
-    }, PIN_OUT_MS + 20);
-    return () => window.clearTimeout(t);
+    });
+    return () => cancelPinTransitionWait();
   }, [
     active,
+    cancelPinTransitionWait,
     expanded,
     pinMotion,
     readSlotBox,
@@ -584,6 +684,7 @@ export function useMobileMapDock(
     writePin,
     releaseToFlow,
     pinRef,
+    waitForPinTransition,
   ]);
 
   useEffect(() => {

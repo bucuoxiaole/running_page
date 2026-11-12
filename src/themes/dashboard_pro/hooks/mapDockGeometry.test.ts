@@ -2,8 +2,14 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
   HEADER_INSET_PX,
+  handoffHeightClose,
   mapDockFabVisible,
   pinAlreadyHome,
+  pinTransitionFallbackMs,
+  PIN_MOTION_MS,
+  PIN_TOP_PX,
+  PIN_TRANSITION_FALLBACK_EXTRA_MS,
+  offscreenPinTop,
   slotFullyVisible,
 } from './mapDockGeometry.ts';
 
@@ -86,5 +92,46 @@ describe('mapDockFabVisible', () => {
 
   it('hides the FAB while most of the slot is still visible', () => {
     assert.equal(mapDockFabVisible(rect(400, 320), VIEW_BOTTOM), false);
+  });
+});
+
+describe('pinTransitionFallbackMs', () => {
+  it('adds the shared extra so transitionend has a bounded fallback', () => {
+    assert.equal(
+      pinTransitionFallbackMs(PIN_MOTION_MS),
+      PIN_MOTION_MS + PIN_TRANSITION_FALLBACK_EXTRA_MS
+    );
+    assert.equal(pinTransitionFallbackMs(470, 80), 550);
+  });
+});
+
+describe('handoffHeightClose', () => {
+  it('accepts equal or 1px-apart heights so the spacer can drop immediately', () => {
+    assert.equal(handoffHeightClose(320, 320), true);
+    assert.equal(handoffHeightClose(320, 319.4), true);
+  });
+
+  it('rejects a real height mismatch that would jump the page', () => {
+    assert.equal(handoffHeightClose(320, 520), false);
+  });
+
+  it('rejects non-finite measurements', () => {
+    assert.equal(handoffHeightClose(Number.NaN, 320), false);
+    assert.equal(handoffHeightClose(320, Number.POSITIVE_INFINITY), false);
+  });
+});
+
+describe('offscreenPinTop', () => {
+  it('places the pin fully above the viewport, not at top-20 - height', () => {
+    const height = 320;
+    // Legacy end/start: bottom edge sits at PIN_TOP_PX (80), still on screen.
+    assert.equal(PIN_TOP_PX - height + height, PIN_TOP_PX);
+    assert.equal(offscreenPinTop(height) + height, -8);
+    assert.ok(offscreenPinTop(height) + height < 0);
+  });
+
+  it('rejects non-positive height without throwing', () => {
+    assert.equal(offscreenPinTop(0), -8);
+    assert.equal(offscreenPinTop(Number.NaN), -8);
   });
 });
